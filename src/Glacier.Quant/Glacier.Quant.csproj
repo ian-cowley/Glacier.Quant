@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    
+    <!-- Package Metadata -->
+    <PackageId>Glacier.Quant</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier Software</Company>
+    <Product>Glacier .NET 10 Ecosystem</Product>
+    <Description>High-throughput SIMD and GPU post-training quantization kernels (Q4_K_M, Q8_0, FP8, 1-bit), PTQ calibration (AWQ, GPTQ, imatrix), and streaming GGUF/Safetensors I/O for .NET 10.</Description>
+    <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Quant</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Quant</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>Copyright (c) 2026 Glacier Software</Copyright>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Glacier.Quant.Tests" />
+  </ItemGroup>
+
+</Project>
