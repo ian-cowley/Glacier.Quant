@@ -271,11 +271,11 @@ public static class QuantQualityChecker
             var refWeightsSpan = refBuffer.AsSpan(0, weightCount);
             var targetWeightsSpan = targetBuffer.AsSpan(0, weightCount);
 
-            QuantizeAndDequantize(referenceWeights, referenceType, refWeightsSpan);
+            QuantizeAndDequantizeMatrix(referenceWeights, vocabSize, hiddenDim, referenceType, refWeightsSpan);
             if (!AllFinite(refWeightsSpan))
                 throw new ArgumentException($"Reference quantization ({referenceType}) produced non-finite weights.", nameof(referenceWeights));
 
-            QuantizeAndDequantize(referenceWeights, targetType, targetWeightsSpan);
+            QuantizeAndDequantizeMatrix(referenceWeights, vocabSize, hiddenDim, targetType, targetWeightsSpan);
             return EvaluateWeights(refWeightsSpan, targetWeightsSpan, activations, numTokens, vocabSize, hiddenDim, opts, bias);
         }
         finally
@@ -343,7 +343,7 @@ public static class QuantQualityChecker
             var refSpan = refBuffer.AsSpan(0, weightCount);
             var candSpan = candBuffer.AsSpan(0, weightCount);
 
-            QuantizeAndDequantize(referenceWeights, referenceType, refSpan);
+            QuantizeAndDequantizeMatrix(referenceWeights, vocabSize, hiddenDim, referenceType, refSpan);
             if (!AllFinite(refSpan))
                 throw new ArgumentException($"Reference quantization ({referenceType}) produced non-finite weights.", nameof(referenceWeights));
 
@@ -388,7 +388,7 @@ public static class QuantQualityChecker
                                 "Scaled AWQ weights contain non-finite values.");
                         }
 
-                        QuantizeAndDequantize(scaledSpan, qt, candSpan);
+                        QuantizeAndDequantizeMatrix(scaledSpan, vocabSize, hiddenDim, qt, candSpan);
 
                         for (int r = 0; r < vocabSize; r++)
                         {
@@ -413,7 +413,7 @@ public static class QuantQualityChecker
                             "Calibrated PTQ weights contain non-finite values.");
                     }
 
-                    QuantizeAndDequantize(ptqResult.CalibratedWeights, qt, candSpan);
+                    QuantizeAndDequantizeMatrix(ptqResult.CalibratedWeights, vocabSize, hiddenDim, qt, candSpan);
                 }
 
                 return EvaluateWeights(refSpan, candSpan, activations, numTokens, vocabSize, hiddenDim, opts, bias);
@@ -583,6 +583,78 @@ public static class QuantQualityChecker
         return EvaluateBlocks1Bit(referenceWeights, quantizedBlocks, activations, dataset.NumTokens, vocabSize, dataset.HiddenDim, options, bias);
     }
 
+    public static KlDivergenceResult EvaluateLittleBit2(
+        ReadOnlySpan<float> referenceWeights,
+        LittleBit2Tensor quantizedTensor,
+        ReadOnlySpan<float> activations,
+        int numTokens,
+        int vocabSize,
+        int hiddenDim,
+        KlDivergenceOptions? options = null,
+        ReadOnlySpan<float> bias = default)
+    {
+        ArgumentNullException.ThrowIfNull(quantizedTensor);
+        ValidateMatrixDimensions(referenceWeights.Length, activations.Length, numTokens, vocabSize, hiddenDim, bias);
+
+        if (quantizedTensor.Rows != vocabSize || quantizedTensor.Cols != hiddenDim)
+            throw new ArgumentException($"LittleBit2 tensor dimensions ({quantizedTensor.Rows}x{quantizedTensor.Cols}) must match ({vocabSize}x{hiddenDim}).", nameof(quantizedTensor));
+
+        float[] dequantBuffer = ArrayPool<float>.Shared.Rent(referenceWeights.Length);
+        try
+        {
+            var dequantSpan = dequantBuffer.AsSpan(0, referenceWeights.Length);
+            LittleBit2Quantizer.Dequantize(quantizedTensor, dequantSpan);
+            return EvaluateWeights(referenceWeights, dequantSpan, activations, numTokens, vocabSize, hiddenDim, options, bias);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(dequantBuffer);
+        }
+    }
+
+    public static KlDivergenceResult EvaluateLittleBit2(
+        ReadOnlySpan<float> referenceWeights,
+        LittleBit2Tensor quantizedTensor,
+        CalibrationDataset dataset,
+        int vocabSize,
+        KlDivergenceOptions? options = null,
+        ReadOnlySpan<float> bias = default)
+    {
+        ArgumentNullException.ThrowIfNull(dataset);
+        var activations = dataset.Activations.AsSpan(0, checked(dataset.NumTokens * dataset.HiddenDim));
+        return EvaluateLittleBit2(referenceWeights, quantizedTensor, activations, dataset.NumTokens, vocabSize, dataset.HiddenDim, options, bias);
+    }
+
+    public static KlDivergenceResult EvaluateLittleBit2(
+        ReadOnlySpan<float> referenceWeights,
+        ReadOnlySpan<float> activations,
+        int numTokens,
+        int vocabSize,
+        int hiddenDim,
+        LittleBit2Options? littleBitOptions = null,
+        KlDivergenceOptions? klOptions = null,
+        ReadOnlySpan<float> bias = default)
+    {
+        ValidateMatrixDimensions(referenceWeights.Length, activations.Length, numTokens, vocabSize, hiddenDim, bias);
+        EnsureAllFinite(referenceWeights, nameof(referenceWeights));
+
+        LittleBit2Tensor quantized = LittleBit2Quantizer.Quantize(referenceWeights, vocabSize, hiddenDim, littleBitOptions);
+        return EvaluateLittleBit2(referenceWeights, quantized, activations, numTokens, vocabSize, hiddenDim, klOptions, bias);
+    }
+
+    public static KlDivergenceResult EvaluateLittleBit2(
+        ReadOnlySpan<float> referenceWeights,
+        CalibrationDataset dataset,
+        int vocabSize,
+        LittleBit2Options? littleBitOptions = null,
+        KlDivergenceOptions? klOptions = null,
+        ReadOnlySpan<float> bias = default)
+    {
+        ArgumentNullException.ThrowIfNull(dataset);
+        var activations = dataset.Activations.AsSpan(0, checked(dataset.NumTokens * dataset.HiddenDim));
+        return EvaluateLittleBit2(referenceWeights, activations, dataset.NumTokens, vocabSize, dataset.HiddenDim, littleBitOptions, klOptions, bias);
+    }
+
     public static KlDivergenceResult EvaluateFp8E4M3(
         ReadOnlySpan<float> referenceWeights,
         ReadOnlySpan<byte> quantizedFp8,
@@ -654,7 +726,7 @@ public static class QuantQualityChecker
             var refSpan = refBuffer.AsSpan(0, weightCount);
             var dequantSpan = dequantBuffer.AsSpan(0, weightCount);
 
-            QuantizeAndDequantize(referenceWeights, referenceType, refSpan);
+            QuantizeAndDequantizeMatrix(referenceWeights, vocabSize, hiddenDim, referenceType, refSpan);
             if (!AllFinite(refSpan))
                 throw new ArgumentException($"Reference quantization ({referenceType}) produced non-finite weights.", nameof(referenceWeights));
 
@@ -693,6 +765,25 @@ public static class QuantQualityChecker
             referenceType,
             options,
             bias);
+    }
+
+    private static void QuantizeAndDequantizeMatrix(
+        ReadOnlySpan<float> weights,
+        int rows,
+        int cols,
+        QuantType quantType,
+        Span<float> dequantizedOutput)
+    {
+        if (quantType == QuantType.LittleBit2)
+        {
+            if (dequantizedOutput.Length < weights.Length)
+                throw new ArgumentException($"Destination span length ({dequantizedOutput.Length}) is smaller than weights length ({weights.Length}).", nameof(dequantizedOutput));
+            LittleBit2Tensor tensor = LittleBit2Quantizer.Quantize(weights, rows, cols);
+            LittleBit2Quantizer.Dequantize(tensor, dequantizedOutput);
+            return;
+        }
+
+        QuantizeAndDequantize(weights, quantType, dequantizedOutput);
     }
 
     private static void ValidateMatrixDimensions(

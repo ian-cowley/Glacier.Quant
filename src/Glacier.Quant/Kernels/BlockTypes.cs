@@ -11,7 +11,8 @@ public enum QuantType : byte
     Q4_K_M = 3,
     FP8_E4M3 = 4,
     FP8_E5M2 = 5,
-    Binary1Bit = 6
+    Binary1Bit = 6,
+    LittleBit2 = 7
 }
 
 /// <summary>

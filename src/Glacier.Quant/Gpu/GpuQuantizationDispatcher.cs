@@ -21,6 +21,7 @@ public static class GpuQuantizationDispatcher
             QuantType.Q4_K_M => ComputeBlockByteCount(elementCount, BlockQ4_K.BlockSize, Unsafe.SizeOf<BlockQ4_K>(), targetType),
             QuantType.FP8_E4M3 => elementCount,
             QuantType.Binary1Bit => ComputeBlockByteCount(elementCount, BlockBinary1Bit.BlockSize, Unsafe.SizeOf<BlockBinary1Bit>(), targetType),
+            QuantType.LittleBit2 => throw new NotSupportedException("QuantType.LittleBit2 requires 2D matrix dimensions (rows, cols); use LittleBit2Quantizer directly."),
             _ => throw new NotSupportedException($"Quantization type {targetType} not supported.")
         };
     }
@@ -61,6 +62,8 @@ public static class GpuQuantizationDispatcher
                 SimdQuantizer.QuantizeRow1Bit(input, blockSpan.Slice(0, numBlocks));
                 break;
             }
+            case QuantType.LittleBit2:
+                throw new NotSupportedException("QuantType.LittleBit2 requires 2D matrix dimensions (rows, cols); use LittleBit2Quantizer directly.");
             default:
                 throw new NotSupportedException($"Quantization type {targetType} not supported.");
         }
@@ -125,6 +128,8 @@ public static class GpuQuantizationDispatcher
                 SimdQuantizer.DequantizeRow1Bit(blockSpan, output);
                 break;
             }
+            case QuantType.LittleBit2:
+                throw new NotSupportedException("QuantType.LittleBit2 requires 2D matrix dimensions (rows, cols); use LittleBit2Quantizer directly.");
             default:
                 throw new NotSupportedException($"Quantization type {sourceType} not supported.");
         }

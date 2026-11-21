@@ -86,6 +86,7 @@ public static class SafetensorsWriter
         Kernels.QuantType.FP8_E4M3 => "F8_E4M3",
         Kernels.QuantType.FP8_E5M2 => "F8_E5M2",
         Kernels.QuantType.Binary1Bit => "U64",
+        Kernels.QuantType.LittleBit2 => "U8",
         _ => "U8"
     };
 }
