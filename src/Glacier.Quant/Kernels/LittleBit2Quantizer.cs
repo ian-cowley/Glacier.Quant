@@ -75,6 +75,9 @@ public static class LittleBit2Quantizer
         return ComputeEffectiveBpw(rows, cols, rank, useResidualCompensation ? rank : 0);
     }
 
+    /// <summary>
+    /// Quantizes row-major <paramref name="weights"/> using optional ADMM binary+scale refinement.
+    /// </summary>
     public static LittleBit2Tensor Quantize(
         ReadOnlySpan<float> weights,
         int rows,
@@ -92,6 +95,8 @@ public static class LittleBit2Quantizer
 
         int primaryRank = opts.Rank ?? ComputeRankForBpw(rows, cols, opts.BitsPerWeight, opts.UseResidualCompensation);
         LittleBit2Path primary = QuantizePath(weights, rows, cols, primaryRank, opts.Seed, opts);
+        if (opts.AdmmIterations > 0)
+            primary = RefinePathAdmm(weights, rows, cols, primary, opts.AdmmIterations, opts.UseParallel);
 
         if (!opts.UseResidualCompensation)
             return new LittleBit2Tensor(rows, cols, primary, residual: null);
@@ -102,13 +107,15 @@ public static class LittleBit2Quantizer
         try
         {
             var wHatSpan = wHatPri.AsSpan(0, total);
+            var wResSpan = wRes.AsSpan(0, total);
             DequantizePath(primary, wHatSpan, accumulate: false, opts.UseParallel);
-
-            for (int i = 0; i < total; i++)
-                wRes[i] = weights[i] - wHatSpan[i];
+            TensorPrimitives.Subtract(weights, wHatSpan, wResSpan);
 
             int residualRank = opts.ResidualRank ?? primaryRank;
-            LittleBit2Path residual = QuantizePath(wRes.AsSpan(0, total), rows, cols, residualRank, unchecked(opts.Seed + 1), opts);
+            LittleBit2Path residual = QuantizePath(wResSpan, rows, cols, residualRank, unchecked(opts.Seed + 1), opts);
+            if (opts.AdmmIterations > 0)
+                residual = RefinePathAdmm(wResSpan, rows, cols, residual, opts.AdmmIterations, opts.UseParallel);
+
             return new LittleBit2Tensor(rows, cols, primary, residual);
         }
         finally
@@ -116,6 +123,259 @@ public static class LittleBit2Quantizer
             ArrayPool<float>.Shared.Return(wHatPri);
             ArrayPool<float>.Shared.Return(wRes);
         }
+    }
+
+    /// <summary>
+    /// Quantizes <paramref name="weights"/> after applying per-column activation weighting <paramref name="columnScales"/>,
+    /// then folds inverse column scales back into <see cref="LittleBit2Path.ColScales"/> with zero inference overhead.
+    /// </summary>
+    public static unsafe LittleBit2Tensor Quantize(
+        ReadOnlySpan<float> weights,
+        int rows,
+        int cols,
+        ReadOnlySpan<float> columnScales,
+        LittleBit2Options? options = null)
+    {
+        var opts = options ?? new LittleBit2Options();
+        opts.Validate(rows, cols);
+
+        long expectedElements = (long)rows * cols;
+        if (weights.Length != expectedElements)
+            throw new ArgumentException($"Weights length ({weights.Length}) must equal rows * cols ({expectedElements}).", nameof(weights));
+
+        ValidatePositiveScales(columnScales, cols, nameof(columnScales));
+        EnsureAllFinite(weights, nameof(weights));
+
+        int total = checked((int)expectedElements);
+        float[] scaled = ArrayPool<float>.Shared.Rent(total);
+        try
+        {
+            if (opts.UseParallel && total >= ParallelWorkThreshold)
+            {
+                fixed (float* pWeights = weights)
+                fixed (float* pScales = columnScales)
+                fixed (float* pScaled = scaled)
+                {
+                    nint wAddr = (nint)pWeights;
+                    nint cAddr = (nint)pScales;
+                    nint sAddr = (nint)pScaled;
+                    Parallel.For(0, rows, r =>
+                    {
+                        long off = (long)r * cols;
+                        TensorPrimitives.Multiply(
+                            new ReadOnlySpan<float>((float*)wAddr + off, cols),
+                            new ReadOnlySpan<float>((float*)cAddr, cols),
+                            new Span<float>((float*)sAddr + off, cols));
+                    });
+                }
+            }
+            else
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    int off = r * cols;
+                    TensorPrimitives.Multiply(
+                        weights.Slice(off, cols),
+                        columnScales,
+                        scaled.AsSpan(off, cols));
+                }
+            }
+
+            LittleBit2Tensor raw = Quantize(scaled.AsSpan(0, total), rows, cols, opts);
+            return ApplyInverseColumnScales(raw, columnScales);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(scaled);
+        }
+    }
+
+    /// <summary>
+    /// Folds <c>1 / columnScales[j]</c> into both paths of <paramref name="tensor"/> with log-space balanced FP16 scales.
+    /// </summary>
+    public static LittleBit2Tensor ApplyInverseColumnScales(
+        LittleBit2Tensor tensor,
+        ReadOnlySpan<float> columnScales)
+    {
+        ArgumentNullException.ThrowIfNull(tensor);
+        ValidatePositiveScales(columnScales, tensor.Cols, nameof(columnScales));
+
+        LittleBit2Path primary = FoldInverseColumnScales(tensor.Primary, columnScales);
+        LittleBit2Path? residual = tensor.Residual is { } resPath ? FoldInverseColumnScales(resPath, columnScales) : null;
+        return new LittleBit2Tensor(tensor.Rows, tensor.Cols, primary, residual);
+    }
+
+    /// <summary>
+    /// Refines a single bit-packed <see cref="LittleBit2Path"/> via alternating binary coordinate descent
+    /// and exact closed-form row/column scale updates, guarded against non-monotonic FP16 rounding regressions.
+    /// </summary>
+    public static unsafe LittleBit2Path RefinePathAdmm(
+        ReadOnlySpan<float> weights,
+        int rows,
+        int cols,
+        LittleBit2Path initial,
+        int iterations,
+        bool useParallel = true)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(rows);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cols);
+        ArgumentNullException.ThrowIfNull(initial);
+        ArgumentOutOfRangeException.ThrowIfNegative(iterations);
+
+        if (initial.Rows != rows || initial.Cols != cols)
+            throw new ArgumentException($"Initial path dimensions ({initial.Rows}x{initial.Cols}) must match ({rows}x{cols}).", nameof(initial));
+
+        long expectedElements = (long)rows * cols;
+        if (weights.Length != expectedElements)
+            throw new ArgumentException($"Weights length ({weights.Length}) must equal rows * cols ({expectedElements}).", nameof(weights));
+
+        EnsureAllFinite(weights, nameof(weights));
+        if (iterations == 0)
+            return initial;
+
+        int total = checked((int)expectedElements);
+        double wNormSq = ComputeSumOfSquares(weights, rows, cols);
+        if (wNormSq <= 1e-24)
+            return initial;
+
+        int rank = initial.Rank;
+        int uStride = initial.UStrideWords;
+        int vStride = initial.VStrideWords;
+
+        ulong[] bestUBits = (ulong[])initial.UBits.Clone();
+        ulong[] bestVBits = (ulong[])initial.VBits.Clone();
+        double[] h = new double[rows];
+        double[] g = new double[cols];
+        double[] ell = new double[rank];
+        for (int i = 0; i < rows; i++) h[i] = (double)initial.RowScales[i];
+        for (int j = 0; j < cols; j++) g[j] = (double)initial.ColScales[j];
+        for (int k = 0; k < rank; k++) ell[k] = (double)initial.LatentScales[k];
+
+        double[] bestH = (double[])h.Clone();
+        double[] bestG = (double[])g.Clone();
+        double[] bestEll = (double[])ell.Clone();
+
+        ulong[] uBits = (ulong[])bestUBits.Clone();
+        ulong[] vBits = (ulong[])bestVBits.Clone();
+
+        int rcLen = checked(rank * cols);
+        int rrLen = checked(rows * rank);
+        int rkSqLen = checked(rank * rank);
+
+        float[] wHatBuf = ArrayPool<float>.Shared.Rent(total);
+        float[] diffBuf = ArrayPool<float>.Shared.Rent(cols);
+        float[] bMat = ArrayPool<float>.Shared.Rent(rcLen);
+        float[] aMat = ArrayPool<float>.Shared.Rent(rrLen);
+        float[] aT = ArrayPool<float>.Shared.Rent(rrLen);
+        float[] wBt = ArrayPool<float>.Shared.Rent(rrLen);
+        float[] gb = ArrayPool<float>.Shared.Rent(rkSqLen);
+        float[] atW = ArrayPool<float>.Shared.Rent(rcLen);
+        float[] ga = ArrayPool<float>.Shared.Rent(rkSqLen);
+        float[] atWT = ArrayPool<float>.Shared.Rent(rcLen);
+        sbyte[] uSigns = ArrayPool<sbyte>.Shared.Rent(rrLen);
+        sbyte[] vSigns = ArrayPool<sbyte>.Shared.Rent(rcLen);
+        sbyte[] vSignsT = ArrayPool<sbyte>.Shared.Rent(rcLen);
+
+        try
+        {
+            double bestErrSq = EvaluatePathErrorSq(weights, initial, wHatBuf.AsSpan(0, total), diffBuf, useParallel);
+
+            UnpackSigns(uBits, rows, rank, uStride, uSigns);
+            UnpackSigns(vBits, rank, cols, vStride, vSigns);
+
+            fixed (float* pWeights = weights)
+            {
+                nint wAddr = (nint)pWeights;
+
+                for (int iter = 0; iter < iterations; iter++)
+                {
+                    // 1. Build B[k, j] = ell[k] * g[j] * V_sign[k, j]
+                    ExecuteRange(rank, useParallel, k =>
+                    {
+                        double lk = ell[k];
+                        int rowOff = k * cols;
+                        for (int j = 0; j < cols; j++)
+                            bMat[rowOff + j] = (float)(lk * g[j] * vSigns[rowOff + j]);
+                    });
+
+                    // Compute WBt = W * B^T [rows x rank] and GB = B * B^T [rank x rank]
+                    ComputeWBtAndGram(wAddr, bMat, rows, cols, rank, wBt, gb, useParallel);
+
+                    // 2. Binary coordinate descent on U_sign[i, k] + exact closed-form row scales h[i]
+                    RefineRowsBinaryAndScale(uSigns, rows, rank, wBt, gb, h, useParallel);
+
+                    // 3. Build A[i, k] = h[i] * ell[k] * U_sign[i, k] and A^T[k, i]
+                    ExecuteRange(rows, useParallel, i =>
+                    {
+                        double hi = h[i];
+                        int rowOff = i * rank;
+                        for (int k = 0; k < rank; k++)
+                            aMat[rowOff + k] = (float)(hi * ell[k] * uSigns[rowOff + k]);
+                    });
+
+                    ComputeAtWAndGram(wAddr, aMat, aT, rows, cols, rank, atW, ga, useParallel);
+
+                    // 4. Transpose V_sign and AtW to [cols x rank], then run identical row solver on columns j
+                    ExecuteRange(cols, useParallel, j =>
+                    {
+                        int dstOff = j * rank;
+                        for (int k = 0; k < rank; k++)
+                        {
+                            int srcIdx = k * cols + j;
+                            vSignsT[dstOff + k] = vSigns[srcIdx];
+                            atWT[dstOff + k] = atW[srcIdx];
+                        }
+                    });
+
+                    RefineRowsBinaryAndScale(vSignsT, cols, rank, atWT, ga, g, useParallel);
+
+                    ExecuteRange(cols, useParallel, j =>
+                    {
+                        int srcOff = j * rank;
+                        for (int k = 0; k < rank; k++)
+                            vSigns[k * cols + j] = vSignsT[srcOff + k];
+                    });
+
+                    PackSigns(uSigns, rows, rank, uStride, uBits);
+                    PackSigns(vSigns, rank, cols, vStride, vBits);
+                    var candidate = PackWithBalancedScales(rows, cols, rank, uBits, vBits, h, g, ell);
+                    double candErrSq = EvaluatePathErrorSq(weights, candidate, wHatBuf.AsSpan(0, total), diffBuf, useParallel);
+
+                    if (candErrSq < bestErrSq)
+                    {
+                        bestErrSq = candErrSq;
+                        bestUBits = (ulong[])candidate.UBits.Clone();
+                        bestVBits = (ulong[])candidate.VBits.Clone();
+                        Array.Copy(h, bestH, rows);
+                        Array.Copy(g, bestG, cols);
+                        Array.Copy(ell, bestEll, rank);
+                    }
+                    else
+                    {
+                        // Strict monotonic guard: stop ADMM once FP16 scale quantization plateaus.
+                        break;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(wHatBuf);
+            ArrayPool<float>.Shared.Return(diffBuf);
+            ArrayPool<float>.Shared.Return(bMat);
+            ArrayPool<float>.Shared.Return(aMat);
+            ArrayPool<float>.Shared.Return(aT);
+            ArrayPool<float>.Shared.Return(wBt);
+            ArrayPool<float>.Shared.Return(gb);
+            ArrayPool<float>.Shared.Return(atW);
+            ArrayPool<float>.Shared.Return(ga);
+            ArrayPool<float>.Shared.Return(atWT);
+            ArrayPool<sbyte>.Shared.Return(uSigns);
+            ArrayPool<sbyte>.Shared.Return(vSigns);
+            ArrayPool<sbyte>.Shared.Return(vSignsT);
+        }
+
+        return PackWithBalancedScales(rows, cols, rank, bestUBits, bestVBits, bestH, bestG, bestEll);
     }
 
     public static float[] Dequantize(LittleBit2Tensor tensor)
@@ -408,29 +668,7 @@ public static class LittleBit2Quantizer
             for (int k = 0; k < rank; k++)
                 ell[k] = ellU[k] * ellV[k];
 
-            Half[] rowScales = new Half[rows];
-            Half[] colScales = new Half[cols];
-            Half[] latentScales = new Half[rank];
-
-            double maxH = MaxPositive(h);
-            double maxL = MaxPositive(ell);
-            double maxG = MaxPositive(g);
-
-            if (maxH > 1e-30 && maxL > 1e-30 && maxG > 1e-30)
-            {
-                // Overflow-safe geometric-mean balancing in log space before FP16 conversion.
-                double logC = (Math.Log(maxH) + Math.Log(maxL) + Math.Log(maxG)) / 3.0;
-                double c = Math.Exp(logC);
-                double alpha = c / maxH;
-                double beta = c / maxG;
-                double gamma = 1.0 / (alpha * beta);
-
-                ConvertToHalfClamped(h, alpha, rowScales);
-                ConvertToHalfClamped(g, beta, colScales);
-                ConvertToHalfClamped(ell, gamma, latentScales);
-            }
-
-            return new LittleBit2Path(rows, cols, rank, uBits, vBits, rowScales, colScales, latentScales);
+            return PackWithBalancedScales(rows, cols, rank, uBits, vBits, h, g, ell);
         }
         finally
         {
@@ -1611,6 +1849,367 @@ public static class LittleBit2Quantizer
             }
         }
         return dst;
+    }
+
+    private static LittleBit2Path FoldInverseColumnScales(LittleBit2Path path, ReadOnlySpan<float> columnScales)
+    {
+        double[] h = new double[path.Rows];
+        double[] g = new double[path.Cols];
+        double[] ell = new double[path.Rank];
+        for (int i = 0; i < path.Rows; i++) h[i] = (double)path.RowScales[i];
+        for (int j = 0; j < path.Cols; j++) g[j] = (double)path.ColScales[j] / Math.Max(columnScales[j], 1e-6f);
+        for (int k = 0; k < path.Rank; k++) ell[k] = (double)path.LatentScales[k];
+
+        return PackWithBalancedScales(
+            path.Rows,
+            path.Cols,
+            path.Rank,
+            (ulong[])path.UBits.Clone(),
+            (ulong[])path.VBits.Clone(),
+            h,
+            g,
+            ell);
+    }
+
+    private static LittleBit2Path PackWithBalancedScales(
+        int rows,
+        int cols,
+        int rank,
+        ulong[] uBits,
+        ulong[] vBits,
+        double[] h,
+        double[] g,
+        double[] ell)
+    {
+        Half[] rowScales = new Half[rows];
+        Half[] colScales = new Half[cols];
+        Half[] latentScales = new Half[rank];
+
+        double maxH = MaxPositive(h);
+        double maxL = MaxPositive(ell);
+        double maxG = MaxPositive(g);
+
+        if (maxH > 1e-30 && maxL > 1e-30 && maxG > 1e-30 &&
+            double.IsFinite(maxH) && double.IsFinite(maxL) && double.IsFinite(maxG))
+        {
+            // Overflow-safe geometric-mean balancing in log space before FP16 conversion.
+            double logProd = Math.Log(maxH) + Math.Log(maxL) + Math.Log(maxG);
+            if (double.IsFinite(logProd))
+            {
+                double logC = logProd / 3.0;
+                double alpha = Math.Exp(logC - Math.Log(maxH));
+                double beta = Math.Exp(logC - Math.Log(maxG));
+                double gamma = Math.Exp(logC - Math.Log(maxL));
+
+                if (double.IsFinite(alpha) && double.IsFinite(beta) && double.IsFinite(gamma))
+                {
+                    ConvertToHalfClamped(h, alpha, rowScales);
+                    ConvertToHalfClamped(g, beta, colScales);
+                    ConvertToHalfClamped(ell, gamma, latentScales);
+                }
+            }
+        }
+
+        return new LittleBit2Path(rows, cols, rank, uBits, vBits, rowScales, colScales, latentScales);
+    }
+
+    private static void ExecuteRange(int count, bool useParallel, Action<int> body)
+    {
+        if (useParallel && count > 1)
+        {
+            Parallel.For(0, count, body);
+        }
+        else
+        {
+            for (int i = 0; i < count; i++)
+                body(i);
+        }
+    }
+
+    private static void UnpackSigns(ulong[] bits, int rows, int cols, int stride, sbyte[] dst)
+    {
+        ExecuteRange(rows, rows * cols >= ParallelWorkThreshold, r =>
+        {
+            int srcOff = r * stride;
+            int dstOff = r * cols;
+            for (int c = 0; c < cols; c++)
+                dst[dstOff + c] = ((bits[srcOff + (c >> 6)] >> (c & 63)) & 1UL) != 0UL ? (sbyte)1 : (sbyte)-1;
+        });
+    }
+
+    private static void PackSigns(sbyte[] signs, int rows, int cols, int stride, ulong[] dst)
+    {
+        Array.Clear(dst);
+        ExecuteRange(rows, rows * cols >= ParallelWorkThreshold, r =>
+        {
+            int srcOff = r * cols;
+            int dstOff = r * stride;
+            for (int c = 0; c < cols; c++)
+            {
+                if (signs[srcOff + c] > 0)
+                    dst[dstOff + (c >> 6)] |= 1UL << (c & 63);
+            }
+        });
+    }
+
+    private static unsafe void ComputeWBtAndGram(
+        nint wAddr,
+        float[] bMat,
+        int rows,
+        int cols,
+        int rank,
+        float[] wBtOut,
+        float[] gbOut,
+        bool useParallel)
+    {
+        ExecuteRange(rows, useParallel, i =>
+        {
+            ReadOnlySpan<float> wRow = new((float*)wAddr + (long)i * cols, cols);
+            int dstOff = i * rank;
+            for (int k = 0; k < rank; k++)
+                wBtOut[dstOff + k] = TensorPrimitives.Dot(wRow, bMat.AsSpan(k * cols, cols));
+        });
+
+        ExecuteRange(rank, useParallel && rank > 1, p =>
+        {
+            ReadOnlySpan<float> bP = bMat.AsSpan(p * cols, cols);
+            for (int q = p; q < rank; q++)
+            {
+                float dot = TensorPrimitives.Dot(bP, bMat.AsSpan(q * cols, cols));
+                gbOut[p * rank + q] = dot;
+                gbOut[q * rank + p] = dot;
+            }
+        });
+    }
+
+    private static unsafe void ComputeAtWAndGram(
+        nint wAddr,
+        float[] aMat,
+        float[] aT,
+        int rows,
+        int cols,
+        int rank,
+        float[] atWOut,
+        float[] gaOut,
+        bool useParallel)
+    {
+        ExecuteRange(rank, useParallel && rank > 1, k =>
+        {
+            int dstOff = k * rows;
+            for (int i = 0; i < rows; i++)
+                aT[dstOff + i] = aMat[i * rank + k];
+        });
+
+        const int ColChunkSize = 256;
+        int numChunks = (cols + ColChunkSize - 1) / ColChunkSize;
+        ExecuteRange(numChunks, useParallel && numChunks > 1, chunkIdx =>
+        {
+            int cStart = chunkIdx * ColChunkSize;
+            int cLen = Math.Min(ColChunkSize, cols - cStart);
+            float* pWBase = (float*)wAddr + cStart;
+
+            for (int k = 0; k < rank; k++)
+            {
+                Span<float> outChunk = atWOut.AsSpan(k * cols + cStart, cLen);
+                outChunk.Clear();
+                int aOff = k * rows;
+                for (int i = 0; i < rows; i++)
+                {
+                    float aik = aT[aOff + i];
+                    if (aik != 0.0f)
+                    {
+                        ReadOnlySpan<float> wChunk = new(pWBase + (long)i * cols, cLen);
+                        TensorPrimitives.MultiplyAdd(wChunk, aik, outChunk, outChunk);
+                    }
+                }
+            }
+        });
+
+        ExecuteRange(rank, useParallel && rank > 1, p =>
+        {
+            ReadOnlySpan<float> aP = aT.AsSpan(p * rows, rows);
+            for (int q = p; q < rank; q++)
+            {
+                float dot = TensorPrimitives.Dot(aP, aT.AsSpan(q * rows, rows));
+                gaOut[p * rank + q] = dot;
+                gaOut[q * rank + p] = dot;
+            }
+        });
+    }
+
+    private static void RefineRowsBinaryAndScale(
+        sbyte[] signsRowMajor,
+        int numVectors,
+        int rank,
+        float[] targetRowMajor,
+        float[] gramMatrix,
+        double[] scales,
+        bool useParallel)
+    {
+        if (useParallel && numVectors > 1)
+        {
+            Parallel.For(
+                0,
+                numVectors,
+                () => (Prod: ArrayPool<float>.Shared.Rent(rank), RowSign: ArrayPool<float>.Shared.Rent(rank)),
+                (idx, _, scratch) =>
+                {
+                    RefineSingleVectorBinaryAndScale(idx, signsRowMajor, rank, targetRowMajor, gramMatrix, scales, scratch.Prod, scratch.RowSign);
+                    return scratch;
+                },
+                scratch =>
+                {
+                    ArrayPool<float>.Shared.Return(scratch.Prod);
+                    ArrayPool<float>.Shared.Return(scratch.RowSign);
+                });
+        }
+        else
+        {
+            float[] prod = ArrayPool<float>.Shared.Rent(rank);
+            float[] signBuf = ArrayPool<float>.Shared.Rent(rank);
+            try
+            {
+                for (int idx = 0; idx < numVectors; idx++)
+                    RefineSingleVectorBinaryAndScale(idx, signsRowMajor, rank, targetRowMajor, gramMatrix, scales, prod, signBuf);
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(prod);
+                ArrayPool<float>.Shared.Return(signBuf);
+            }
+        }
+    }
+
+    private static void RefineSingleVectorBinaryAndScale(
+        int idx,
+        sbyte[] signsRowMajor,
+        int rank,
+        float[] targetRowMajor,
+        float[] gramMatrix,
+        double[] scales,
+        float[] prod,
+        float[] signBuf)
+    {
+        int rowOff = idx * rank;
+        double sVal = scales[idx];
+
+        for (int k = 0; k < rank; k++)
+            signBuf[k] = signsRowMajor[rowOff + k];
+
+        ReadOnlySpan<float> signSpan = signBuf.AsSpan(0, rank);
+        Span<float> prodSpan = prod.AsSpan(0, rank);
+        for (int k = 0; k < rank; k++)
+            prod[k] = TensorPrimitives.Dot(signSpan, gramMatrix.AsSpan(k * rank, rank));
+
+        if (sVal > 1e-12)
+        {
+            float sF = (float)sVal;
+            for (int k = 0; k < rank; k++)
+            {
+                float oldSign = signBuf[k];
+                int gramRow = k * rank;
+                float predOther = prod[k] - oldSign * gramMatrix[gramRow + k];
+                float score = targetRowMajor[rowOff + k] - sF * predOther;
+                float newSign = score >= 0.0f ? 1.0f : -1.0f;
+                if (newSign != oldSign)
+                {
+                    signBuf[k] = newSign;
+                    signsRowMajor[rowOff + k] = (sbyte)newSign;
+                    float delta = newSign - oldSign;
+                    TensorPrimitives.MultiplyAdd(gramMatrix.AsSpan(gramRow, rank), delta, prodSpan, prodSpan);
+                }
+            }
+        }
+
+        double num = TensorPrimitives.Dot(signSpan, targetRowMajor.AsSpan(rowOff, rank));
+        double den = TensorPrimitives.Dot(signSpan, prodSpan);
+
+        if (den > 1e-18)
+        {
+            double sNew = num / den;
+            if (sNew < 0.0)
+            {
+                sNew = -sNew;
+                for (int k = 0; k < rank; k++)
+                    signsRowMajor[rowOff + k] = (sbyte)(-signsRowMajor[rowOff + k]);
+            }
+            scales[idx] = sNew;
+        }
+    }
+
+    private static unsafe double EvaluatePathErrorSq(
+        ReadOnlySpan<float> weights,
+        LittleBit2Path path,
+        Span<float> wHat,
+        float[] sequentialDiffBuf,
+        bool useParallel)
+    {
+        int rows = path.Rows;
+        int cols = path.Cols;
+        DequantizePath(path, wHat, accumulate: false, useParallel);
+
+        if (useParallel && rows > 1 && (long)rows * cols >= ParallelWorkThreshold)
+        {
+            object lockObj = new();
+            double totalErrSq = 0.0;
+            fixed (float* pW = weights)
+            fixed (float* pWHat = wHat)
+            {
+                nint wAddr = (nint)pW;
+                nint hAddr = (nint)pWHat;
+                Parallel.For(
+                    0,
+                    rows,
+                    () => (Sum: 0.0, Diff: ArrayPool<float>.Shared.Rent(cols)),
+                    (r, _, state) =>
+                    {
+                        long off = (long)r * cols;
+                        Span<float> diffSpan = state.Diff.AsSpan(0, cols);
+                        TensorPrimitives.Subtract(
+                            new ReadOnlySpan<float>((float*)wAddr + off, cols),
+                            new ReadOnlySpan<float>((float*)hAddr + off, cols),
+                            diffSpan);
+                        state.Sum += TensorPrimitives.SumOfSquares(diffSpan);
+                        return state;
+                    },
+                    state =>
+                    {
+                        ArrayPool<float>.Shared.Return(state.Diff);
+                        lock (lockObj) totalErrSq += state.Sum;
+                    });
+            }
+            return totalErrSq;
+        }
+
+        double errSq = 0.0;
+        Span<float> diff = sequentialDiffBuf.AsSpan(0, cols);
+        for (int r = 0; r < rows; r++)
+        {
+            int off = r * cols;
+            TensorPrimitives.Subtract(weights.Slice(off, cols), wHat.Slice(off, cols), diff);
+            errSq += TensorPrimitives.SumOfSquares(diff);
+        }
+        return errSq;
+    }
+
+    private static double ComputeSumOfSquares(ReadOnlySpan<float> weights, int rows, int cols)
+    {
+        double sum = 0.0;
+        for (int r = 0; r < rows; r++)
+            sum += TensorPrimitives.SumOfSquares(weights.Slice(r * cols, cols));
+        return sum;
+    }
+
+    private static void ValidatePositiveScales(ReadOnlySpan<float> scales, int expectedCols, string paramName)
+    {
+        if (scales.Length != expectedCols)
+            throw new ArgumentException($"Column scales length ({scales.Length}) must equal cols ({expectedCols}).", paramName);
+
+        for (int j = 0; j < expectedCols; j++)
+        {
+            if (!float.IsFinite(scales[j]) || scales[j] <= 0.0f)
+                throw new ArgumentException($"Input '{paramName}' must contain finite positive values (invalid value {scales[j]} at index {j}).", paramName);
+        }
     }
 
     private static double MaxPositive(double[] values)

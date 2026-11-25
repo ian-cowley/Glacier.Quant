@@ -22,22 +22,27 @@ public static class KlDivergenceEvaluator
         if (logProbs.Length < logits.Length)
             throw new ArgumentException($"Destination span length ({logProbs.Length}) is smaller than logits length ({logits.Length}).", nameof(logProbs));
 
-        double maxLogit = FindMaxAndValidateLogits(logits, nameof(logits));
-        double sumExp = 0.0;
+        double maxLogit = FindMaxAndArgMaxLogits(logits, nameof(logits), out int argMax);
+        double sumOther = 0.0;
         for (int i = 0; i < logits.Length; i++)
         {
+            if (i == argMax) continue;
             float v = logits[i];
             if (!float.IsNegativeInfinity(v))
-                sumExp += Math.Exp((double)v - maxLogit);
+                sumOther += Math.Exp((double)v - maxLogit);
         }
 
-        double logSumExpShift = Math.Log(sumExp);
+        double logSumExpShift = Log1p(sumOther);
         for (int i = 0; i < logits.Length; i++)
         {
             float v = logits[i];
             if (float.IsNegativeInfinity(v))
             {
                 logProbs[i] = double.NegativeInfinity;
+            }
+            else if (i == argMax)
+            {
+                logProbs[i] = -logSumExpShift;
             }
             else
             {
@@ -364,22 +369,28 @@ public static class KlDivergenceEvaluator
 
         top1Match = argMaxRef == argMaxQuant;
 
-        // Pass 2: shifted sum of exponentials in double precision
-        double sumExpRef = 0.0;
-        double sumExpQuant = 0.0;
+        // Pass 2: shifted sum of non-argmax exponentials in double precision using Log1p
+        double sumOtherRef = 0.0;
+        double sumOtherQuant = 0.0;
         for (int i = 0; i < n; i++)
         {
-            float r = referenceLogits[i];
-            if (!float.IsNegativeInfinity(r))
-                sumExpRef += Math.Exp((double)r - maxRef);
+            if (i != argMaxRef)
+            {
+                float r = referenceLogits[i];
+                if (!float.IsNegativeInfinity(r))
+                    sumOtherRef += Math.Exp((double)r - maxRef);
+            }
 
-            float q = quantizedLogits[i];
-            if (!float.IsNegativeInfinity(q))
-                sumExpQuant += Math.Exp((double)q - maxQuant);
+            if (i != argMaxQuant)
+            {
+                float q = quantizedLogits[i];
+                if (!float.IsNegativeInfinity(q))
+                    sumOtherQuant += Math.Exp((double)q - maxQuant);
+            }
         }
 
-        double logSumRef = Math.Log(sumExpRef);
-        double logSumQuant = Math.Log(sumExpQuant);
+        double logSumRef = Log1p(sumOtherRef);
+        double logSumQuant = Log1p(sumOtherQuant);
         double logEpsilon = Math.Log(epsilon);
 
         // Pass 3: accumulate KL divergence D_KL(P || Q) = sum_i P_i * (log P_i - log Q_i)
@@ -413,6 +424,40 @@ public static class KlDivergenceEvaluator
         }
 
         return kl < 0.0 ? 0.0 : kl;
+    }
+
+    private static double Log1p(double x)
+    {
+        if (x == 0.0) return 0.0;
+        double u = 1.0 + x;
+        if (u == 1.0) return x;
+        return Math.Log(u) * (x / (u - 1.0));
+    }
+
+    private static double FindMaxAndArgMaxLogits(ReadOnlySpan<float> logits, string paramName, out int argMax)
+    {
+        double maxLogit = double.NegativeInfinity;
+        argMax = -1;
+        bool hasFinite = false;
+
+        for (int i = 0; i < logits.Length; i++)
+        {
+            float v = logits[i];
+            if (float.IsNaN(v) || float.IsPositiveInfinity(v))
+                throw new ArgumentException($"Logits contain invalid value ({v}) at index {i}.", paramName);
+
+            if (!float.IsNegativeInfinity(v) && (!hasFinite || v > maxLogit))
+            {
+                hasFinite = true;
+                maxLogit = v;
+                argMax = i;
+            }
+        }
+
+        if (!hasFinite)
+            throw new ArgumentException("Logits cannot consist exclusively of -Infinity.", paramName);
+
+        return maxLogit;
     }
 
     private static double FindMaxAndValidateLogits(ReadOnlySpan<float> logits, string paramName)

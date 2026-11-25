@@ -10,17 +10,22 @@
     
     <!-- Package Metadata -->
     <PackageId>Glacier.Quant</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier Software</Company>
     <Product>Glacier .NET 10 Ecosystem</Product>
-    <Description>High-throughput SIMD and GPU post-training quantization kernels (Q4_K_M, Q8_0, FP8, 1-bit), PTQ calibration (AWQ, GPTQ, imatrix), and streaming GGUF/Safetensors I/O for .NET 10.</Description>
+    <Description>High-throughput SIMD post-training quantization kernels (Q4_K_M, Q8_0, FP8, 1-bit, LittleBit-2 sub-1-bit), Samsung LittleBit-2 checkpoint codec, activation-weighted salient column selection, Log1p-stabilized KL divergence evaluation, PTQ calibration (AWQ, GPTQ, imatrix), and streaming GGUF/Safetensors I/O for .NET 10.</Description>
     <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Quant</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Quant</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <Copyright>Copyright (c) 2026 Glacier Software</Copyright>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="System.Numerics.Tensors" Version="10.0.12" />

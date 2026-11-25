@@ -2,6 +2,8 @@ namespace Glacier.Quant.Kernels;
 
 using System;
 using System.Buffers;
+using System.Numerics.Tensors;
+using System.Threading.Tasks;
 
 /// <summary>
 /// Pure-C# AOT-compatible double-precision linear algebra kernels for LittleBit-2:
@@ -493,18 +495,34 @@ internal static class LittleBit2Svd
 
             // U_r = Q * uHat[:, 0:r]
             double[] uR = new double[checked(m * r)];
-            for (int i = 0; i < m; i++)
+            if ((long)m * k * r >= 262_144L && m >= 16)
             {
-                int qRow = i * k;
-                int uRow = i * r;
-                for (int t = 0; t < k; t++)
+                Parallel.For(0, m, i =>
                 {
-                    double qit = q[qRow + t];
-                    if (qit == 0.0)
-                        continue;
-                    int hatRow = t * k;
-                    for (int c = 0; c < r; c++)
-                        uR[uRow + c] += qit * uHat[hatRow + c];
+                    int qRow = i * k;
+                    Span<double> uSlice = uR.AsSpan(i * r, r);
+                    for (int t = 0; t < k; t++)
+                    {
+                        double qit = q[qRow + t];
+                        if (qit == 0.0)
+                            continue;
+                        TensorPrimitives.MultiplyAdd(uHat.AsSpan(t * k, r), qit, uSlice, uSlice);
+                    }
+                });
+            }
+            else
+            {
+                for (int i = 0; i < m; i++)
+                {
+                    int qRow = i * k;
+                    Span<double> uSlice = uR.AsSpan(i * r, r);
+                    for (int t = 0; t < k; t++)
+                    {
+                        double qit = q[qRow + t];
+                        if (qit == 0.0)
+                            continue;
+                        TensorPrimitives.MultiplyAdd(uHat.AsSpan(t * k, r), qit, uSlice, uSlice);
+                    }
                 }
             }
 
@@ -540,18 +558,34 @@ internal static class LittleBit2Svd
 
             // V_r = Q * vHat[:, 0:r]
             double[] vR = new double[checked(n * r)];
-            for (int j = 0; j < n; j++)
+            if ((long)n * k * r >= 262_144L && n >= 16)
             {
-                int qRow = j * k;
-                int vRow = j * r;
-                for (int t = 0; t < k; t++)
+                Parallel.For(0, n, j =>
                 {
-                    double qjt = q[qRow + t];
-                    if (qjt == 0.0)
-                        continue;
-                    int hatRow = t * k;
-                    for (int c = 0; c < r; c++)
-                        vR[vRow + c] += qjt * vHat[hatRow + c];
+                    int qRow = j * k;
+                    Span<double> vSlice = vR.AsSpan(j * r, r);
+                    for (int t = 0; t < k; t++)
+                    {
+                        double qjt = q[qRow + t];
+                        if (qjt == 0.0)
+                            continue;
+                        TensorPrimitives.MultiplyAdd(vHat.AsSpan(t * k, r), qjt, vSlice, vSlice);
+                    }
+                });
+            }
+            else
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    int qRow = j * k;
+                    Span<double> vSlice = vR.AsSpan(j * r, r);
+                    for (int t = 0; t < k; t++)
+                    {
+                        double qjt = q[qRow + t];
+                        if (qjt == 0.0)
+                            continue;
+                        TensorPrimitives.MultiplyAdd(vHat.AsSpan(t * k, r), qjt, vSlice, vSlice);
+                    }
                 }
             }
 
@@ -570,12 +604,7 @@ internal static class LittleBit2Svd
         uVec = new double[m];
         vVec = new double[n];
 
-        double frobSq = 0.0;
-        for (int i = 0; i < absMatrixRowMajor.Length; i++)
-        {
-            double val = absMatrixRowMajor[i];
-            frobSq += val * val;
-        }
+        double frobSq = TensorPrimitives.SumOfSquares(absMatrixRowMajor);
 
         if (Math.Sqrt(frobSq) <= 1e-15)
             return;
@@ -585,47 +614,83 @@ internal static class LittleBit2Svd
         double[] vNext = new double[n];
 
         double initV = 1.0 / Math.Sqrt(n);
-        for (int j = 0; j < n; j++)
-            v[j] = initV;
+        Array.Fill(v, initV);
+
+        bool useParallel = (long)m * n >= 262_144L && m >= 16 && n >= 16;
 
         for (int iter = 0; iter < maxIterations; iter++)
         {
             // u = M * v
-            double uNormSq = 0.0;
-            for (int i = 0; i < m; i++)
+            if (useParallel)
             {
-                int rowOff = i * n;
-                double sum = 0.0;
-                for (int j = 0; j < n; j++)
-                    sum += absMatrixRowMajor[rowOff + j] * v[j];
-                u[i] = sum;
-                uNormSq += sum * sum;
+                unsafe
+                {
+                    fixed (double* pAbs = absMatrixRowMajor)
+                    {
+                        nint absAddr = (nint)pAbs;
+                        Parallel.For(0, m, i =>
+                        {
+                            var row = new ReadOnlySpan<double>((double*)absAddr + (long)i * n, n);
+                            u[i] = TensorPrimitives.Dot(row, v);
+                        });
+                    }
+                }
+            }
+            else
+            {
+                for (int i = 0; i < m; i++)
+                    u[i] = TensorPrimitives.Dot(absMatrixRowMajor.Slice(i * n, n), v);
             }
 
+            double uNormSq = TensorPrimitives.SumOfSquares(u);
             double uNorm = Math.Sqrt(uNormSq);
             if (uNorm <= 1e-30)
                 return;
 
-            double invUNorm = 1.0 / uNorm;
-            for (int i = 0; i < m; i++)
-                u[i] *= invUNorm;
+            TensorPrimitives.Multiply(u, 1.0 / uNorm, u);
 
-            // vNext = M^T * u
+            // vNext = M^T * u (partition disjoint column tiles for lock-free deterministic accumulation)
             Array.Clear(vNext);
-            for (int i = 0; i < m; i++)
+            if (useParallel)
             {
-                double ui = u[i];
-                if (ui == 0.0)
-                    continue;
-                int rowOff = i * n;
-                for (int j = 0; j < n; j++)
-                    vNext[j] += absMatrixRowMajor[rowOff + j] * ui;
+                unsafe
+                {
+                    fixed (double* pAbs = absMatrixRowMajor)
+                    {
+                        nint absAddr = (nint)pAbs;
+                        const int ColTile = 256;
+                        int numTiles = (n + ColTile - 1) / ColTile;
+                        Parallel.For(0, numTiles, tileIdx =>
+                        {
+                            int jStart = tileIdx * ColTile;
+                            int jCount = Math.Min(ColTile, n - jStart);
+                            Span<double> vTile = vNext.AsSpan(jStart, jCount);
+                            double* basePtr = (double*)absAddr + jStart;
+                            for (int i = 0; i < m; i++)
+                            {
+                                double ui = u[i];
+                                if (ui == 0.0)
+                                    continue;
+                                var rowTile = new ReadOnlySpan<double>(basePtr + (long)i * n, jCount);
+                                TensorPrimitives.MultiplyAdd(rowTile, ui, vTile, vTile);
+                            }
+                        });
+                    }
+                }
+            }
+            else
+            {
+                Span<double> vNextSpan = vNext;
+                for (int i = 0; i < m; i++)
+                {
+                    double ui = u[i];
+                    if (ui == 0.0)
+                        continue;
+                    TensorPrimitives.MultiplyAdd(absMatrixRowMajor.Slice(i * n, n), ui, vNextSpan, vNextSpan);
+                }
             }
 
-            double vNormSq = 0.0;
-            for (int j = 0; j < n; j++)
-                vNormSq += vNext[j] * vNext[j];
-
+            double vNormSq = TensorPrimitives.SumOfSquares(vNext);
             double vNorm = Math.Sqrt(vNormSq);
             if (vNorm <= 1e-30)
                 return;
@@ -646,20 +711,32 @@ internal static class LittleBit2Svd
 
         // Rayleigh quotient sigma_0 = u^T (M v)
         double sigma = 0.0;
-        for (int i = 0; i < m; i++)
+        if (useParallel)
         {
-            int rowOff = i * n;
-            double mv = 0.0;
-            for (int j = 0; j < n; j++)
-                mv += absMatrixRowMajor[rowOff + j] * v[j];
-            sigma += u[i] * mv;
+            double[] partials = new double[m];
+            unsafe
+            {
+                fixed (double* pAbs = absMatrixRowMajor)
+                {
+                    nint absAddr = (nint)pAbs;
+                    Parallel.For(0, m, i =>
+                    {
+                        var row = new ReadOnlySpan<double>((double*)absAddr + (long)i * n, n);
+                        partials[i] = u[i] * TensorPrimitives.Dot(row, v);
+                    });
+                }
+            }
+            sigma = TensorPrimitives.Sum(partials);
+        }
+        else
+        {
+            for (int i = 0; i < m; i++)
+                sigma += u[i] * TensorPrimitives.Dot(absMatrixRowMajor.Slice(i * n, n), v);
         }
 
         double s0 = Math.Sqrt(Math.Max(0.0, sigma));
-        for (int i = 0; i < m; i++)
-            uVec[i] = s0 * u[i];
-        for (int j = 0; j < n; j++)
-            vVec[j] = s0 * v[j];
+        TensorPrimitives.Multiply(u, s0, uVec);
+        TensorPrimitives.Multiply(v, s0, vVec);
     }
 
     private static void BuildSymmetricFactors(
@@ -707,18 +784,40 @@ internal static class LittleBit2Svd
         double[] y)
     {
         Array.Clear(y, 0, m * k);
+        if ((long)m * n * k >= 262_144L && m >= 16)
+        {
+            unsafe
+            {
+                fixed (float* pW = w)
+                {
+                    nint wAddr = (nint)pW;
+                    Parallel.For(0, m, i =>
+                    {
+                        float* wRow = (float*)wAddr + (long)i * n;
+                        Span<double> ySlice = y.AsSpan(i * k, k);
+                        for (int j = 0; j < n; j++)
+                        {
+                            double wij = wRow[j];
+                            if (wij == 0.0)
+                                continue;
+                            TensorPrimitives.MultiplyAdd(q.AsSpan(j * k, k), wij, ySlice, ySlice);
+                        }
+                    });
+                }
+            }
+            return;
+        }
+
         for (int i = 0; i < m; i++)
         {
             int wRow = i * n;
-            int yRow = i * k;
+            Span<double> ySlice = y.AsSpan(i * k, k);
             for (int j = 0; j < n; j++)
             {
                 double wij = w[wRow + j];
                 if (wij == 0.0)
                     continue;
-                int qRow = j * k;
-                for (int c = 0; c < k; c++)
-                    y[yRow + c] += wij * q[qRow + c];
+                TensorPrimitives.MultiplyAdd(q.AsSpan(j * k, k), wij, ySlice, ySlice);
             }
         }
     }
@@ -732,18 +831,50 @@ internal static class LittleBit2Svd
         double[] z)
     {
         Array.Clear(z, 0, n * k);
+        if ((long)m * n * k >= 262_144L && n >= 16)
+        {
+            unsafe
+            {
+                fixed (float* pW = w)
+                {
+                    nint wAddr = (nint)pW;
+                    const int ColBlock = 32;
+                    int numBlocks = (n + ColBlock - 1) / ColBlock;
+                    Parallel.For(0, numBlocks, blockIdx =>
+                    {
+                        int jStart = blockIdx * ColBlock;
+                        int jEnd = Math.Min(n, jStart + ColBlock);
+                        float* basePtr = (float*)wAddr;
+                        for (int i = 0; i < m; i++)
+                        {
+                            float* wRow = basePtr + (long)i * n;
+                            ReadOnlySpan<double> qSlice = q.AsSpan(i * k, k);
+                            for (int j = jStart; j < jEnd; j++)
+                            {
+                                double wij = wRow[j];
+                                if (wij == 0.0)
+                                    continue;
+                                Span<double> zSlice = z.AsSpan(j * k, k);
+                                TensorPrimitives.MultiplyAdd(qSlice, wij, zSlice, zSlice);
+                            }
+                        }
+                    });
+                }
+            }
+            return;
+        }
+
         for (int i = 0; i < m; i++)
         {
             int wRow = i * n;
-            int qRow = i * k;
+            ReadOnlySpan<double> qSlice = q.AsSpan(i * k, k);
             for (int j = 0; j < n; j++)
             {
                 double wij = w[wRow + j];
                 if (wij == 0.0)
                     continue;
-                int zRow = j * k;
-                for (int c = 0; c < k; c++)
-                    z[zRow + c] += wij * q[qRow + c];
+                Span<double> zSlice = z.AsSpan(j * k, k);
+                TensorPrimitives.MultiplyAdd(qSlice, wij, zSlice, zSlice);
             }
         }
     }
@@ -757,18 +888,56 @@ internal static class LittleBit2Svd
         double[] bProj)
     {
         Array.Clear(bProj, 0, k * n);
+        const int ChunkCols = 256;
+        if ((long)m * n * k >= 262_144L)
+        {
+            int numColTiles = (n + ChunkCols - 1) / ChunkCols;
+            int totalTasks = k * numColTiles;
+            unsafe
+            {
+                fixed (float* pW = w)
+                {
+                    nint wAddr = (nint)pW;
+                    Parallel.For(0, totalTasks, taskIdx =>
+                    {
+                        int c = taskIdx / numColTiles;
+                        int tileIdx = taskIdx % numColTiles;
+                        int jStart = tileIdx * ChunkCols;
+                        int jCount = Math.Min(ChunkCols, n - jStart);
+
+                        Span<double> wDouble = stackalloc double[jCount];
+                        Span<double> bSlice = bProj.AsSpan(c * n + jStart, jCount);
+                        float* basePtr = (float*)wAddr + jStart;
+                        for (int i = 0; i < m; i++)
+                        {
+                            double qic = q[i * k + c];
+                            if (qic == 0.0)
+                                continue;
+                            float* wTile = basePtr + (long)i * n;
+                            for (int jj = 0; jj < jCount; jj++)
+                                wDouble[jj] = wTile[jj];
+                            TensorPrimitives.MultiplyAdd(wDouble, qic, bSlice, bSlice);
+                        }
+                    });
+                }
+            }
+            return;
+        }
+
+        Span<double> buf = n <= ChunkCols ? stackalloc double[n] : new double[n];
         for (int i = 0; i < m; i++)
         {
             int qRow = i * k;
-            int wRow = i * n;
+            ReadOnlySpan<float> wRow = w.Slice(i * n, n);
+            for (int j = 0; j < n; j++)
+                buf[j] = wRow[j];
             for (int c = 0; c < k; c++)
             {
                 double qic = q[qRow + c];
                 if (qic == 0.0)
                     continue;
-                int bRow = c * n;
-                for (int j = 0; j < n; j++)
-                    bProj[bRow + j] += qic * w[wRow + j];
+                Span<double> bSlice = bProj.AsSpan(c * n, n);
+                TensorPrimitives.MultiplyAdd(buf, qic, bSlice, bSlice);
             }
         }
     }
@@ -780,36 +949,23 @@ internal static class LittleBit2Svd
     }
 
     private static double Dot(double[] data, int offsetA, int offsetB, int length)
-    {
-        double sum = 0.0;
-        for (int i = 0; i < length; i++)
-            sum += data[offsetA + i] * data[offsetB + i];
-        return sum;
-    }
+        => TensorPrimitives.Dot(data.AsSpan(offsetA, length), data.AsSpan(offsetB, length));
 
     private static double NormSq(double[] data, int offset, int length)
-    {
-        double sum = 0.0;
-        for (int i = 0; i < length; i++)
-        {
-            double val = data[offset + i];
-            sum += val * val;
-        }
-        return sum;
-    }
+        => TensorPrimitives.SumOfSquares(data.AsSpan(offset, length));
 
     private static void Axpy(double alpha, double[] data, int offsetX, int offsetY, int length)
     {
         if (alpha == 0.0)
             return;
-        for (int i = 0; i < length; i++)
-            data[offsetY + i] += alpha * data[offsetX + i];
+        var y = data.AsSpan(offsetY, length);
+        TensorPrimitives.MultiplyAdd(data.AsSpan(offsetX, length), alpha, y, y);
     }
 
     private static void Scale(double[] data, int offset, int length, double scale)
     {
-        for (int i = 0; i < length; i++)
-            data[offset + i] *= scale;
+        var v = data.AsSpan(offset, length);
+        TensorPrimitives.Multiply(v, scale, v);
     }
 
     private struct SplitMix64

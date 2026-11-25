@@ -39,6 +39,9 @@ public sealed record LittleBit2Options
     /// <summary>Maximum number of Joint-ITQ alternating Procrustes iterations.</summary>
     public int JointItqIterations { get; init; } = 50;
 
+    /// <summary>Maximum number of alternating binary + closed-form scale ADMM refinement iterations per path.</summary>
+    public int AdmmIterations { get; init; } = 0;
+
     /// <summary>Deterministic PRNG seed for randomized SVD and orthogonal rotation initialization.</summary>
     public int Seed { get; init; } = 42;
 
@@ -78,6 +81,7 @@ public sealed record LittleBit2Options
             throw new ArgumentOutOfRangeException(nameof(RotationMode), RotationMode, "Unsupported LittleBit2RotationMode value.");
 
         ArgumentOutOfRangeException.ThrowIfNegative(JointItqIterations);
+        ArgumentOutOfRangeException.ThrowIfNegative(AdmmIterations);
         ArgumentOutOfRangeException.ThrowIfNegative(SvdOversampling);
         ArgumentOutOfRangeException.ThrowIfNegative(PowerIterations);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(Rank1SvdIterations);
