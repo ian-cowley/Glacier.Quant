@@ -57,6 +57,20 @@ public class QuantizationKernelTests
         mse /= original.Length;
 
         Assert.True(mse < 0.05, $"Q4_K MSE ({mse}) exceeded threshold 0.05");
+
+        // Verify non-zero scales are written (spec-compliant 8-subblock packing)
+        bool hasNonZeroScale = false;
+        unsafe
+        {
+            fixed (BlockQ4_K* pB = blocks)
+            {
+                for (int s = 0; s < 12; s++)
+                {
+                    if (pB[0].Scales[s] != 0) hasNonZeroScale = true;
+                }
+            }
+        }
+        Assert.True(hasNonZeroScale, "Q4_K Scales must be populated.");
     }
 
     [Fact]

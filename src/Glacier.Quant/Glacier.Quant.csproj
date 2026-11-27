@@ -10,7 +10,8 @@
     
     <!-- Package Metadata -->
     <PackageId>Glacier.Quant</PackageId>
-    <Version>1.4.0</Version>
+    <Version>1.4.1</Version>
+    <PackageReleaseNotes>v1.4.1: Quantization kernel and GGUF/Safetensors reliability improvements.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier Software</Company>
     <Product>Glacier .NET 10 Ecosystem</Product>

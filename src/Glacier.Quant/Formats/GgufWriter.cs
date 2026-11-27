@@ -73,7 +73,7 @@ public static class GgufWriter
             {
                 bw.Write((ulong)info.Shape[d]);
             }
-            bw.Write((uint)info.Type);
+            bw.Write(ToGgmlType(info.Type));
             bw.Write(calculatedOffsets[i]);
         }
 
@@ -101,6 +101,32 @@ public static class GgufWriter
 
         bw.Flush();
     }
+
+    internal static uint ToGgmlType(QuantType type) => type switch
+    {
+        QuantType.FP32 => 0u,
+        QuantType.FP16 => 1u,
+        QuantType.Q8_0 => 8u,
+        QuantType.Q4_K_M => 12u,
+        QuantType.FP8_E4M3 => 104u,
+        QuantType.FP8_E5M2 => 105u,
+        QuantType.Binary1Bit => 106u,
+        QuantType.LittleBit2 => 107u,
+        _ => throw new NotSupportedException($"Unsupported QuantType for GGUF serialization: {type}.")
+    };
+
+    internal static QuantType FromGgmlType(uint ggmlType) => ggmlType switch
+    {
+        0u => QuantType.FP32,
+        1u => QuantType.FP16,
+        8u => QuantType.Q8_0,
+        12u => QuantType.Q4_K_M,
+        104u => QuantType.FP8_E4M3,
+        105u => QuantType.FP8_E5M2,
+        106u => QuantType.Binary1Bit,
+        107u => QuantType.LittleBit2,
+        _ => throw new NotSupportedException($"Unsupported GGUF ggml_type ID: {ggmlType}.")
+    };
 
     private static void WriteString(BinaryWriter bw, string str)
     {
@@ -162,7 +188,7 @@ public static class GgufReader
             {
                 Name = name,
                 Shape = shape,
-                Type = (QuantType)type,
+                Type = GgufWriter.FromGgmlType(type),
                 DataOffset = offset
             });
         }

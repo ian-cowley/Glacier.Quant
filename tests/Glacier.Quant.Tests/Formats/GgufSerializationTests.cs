@@ -75,5 +75,18 @@ public class GgufSerializationTests
         byte[] read2 = new byte[tensor2Data.Length];
         ms.ReadExactly(read2);
         Assert.Equal(tensor2Data, read2);
+
+        // Verify standard ggml_type IDs are written (Q8_0=8, Q4_K=12, FP16=1)
+        var q4kTensors = new List<(QuantTensorMetadata Info, byte[] Data)>
+        {
+            (new QuantTensorMetadata { Name = "w", Shape = [256], Type = QuantType.Q4_K_M }, new byte[144])
+        };
+        using var ms2 = new MemoryStream();
+        GgufWriter.WriteToStream(ms2, new Dictionary<string, string>(), q4kTensors);
+        ms2.Position = 0;
+        var (_, rt2, _) = GgufReader.ReadHeader(ms2);
+        Assert.Equal(QuantType.Q4_K_M, rt2[0].Type);
+        Assert.Equal(8u, GgufWriter.ToGgmlType(QuantType.Q8_0));
+        Assert.Equal(12u, GgufWriter.ToGgmlType(QuantType.Q4_K_M));
     }
 }

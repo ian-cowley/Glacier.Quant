@@ -106,44 +106,91 @@ public static class SimdQuantizer
         fixed (float* pSrc = src)
         fixed (BlockQ4_K* pDst = dst)
         {
+            float* subScale = stackalloc float[8];
+            float* subMin = stackalloc float[8];
+            byte* sc = stackalloc byte[8];
+            byte* m = stackalloc byte[8];
+            byte* L = stackalloc byte[256];
+
             for (int b = 0; b < numSuperBlocks; b++)
             {
                 float* sbSrc = pSrc + (b * BlockQ4_K.BlockSize);
                 BlockQ4_K* sbDst = pDst + b;
 
-                // Find global min and max across all 8 sub-blocks of 32 elements
-                float minVal = float.MaxValue;
-                float maxVal = float.MinValue;
-                for (int i = 0; i < BlockQ4_K.BlockSize; i++)
+                float maxScale = 0f;
+                float maxMin = 0f;
+
+                for (int ib = 0; ib < 8; ib++)
                 {
-                    float v = sbSrc[i];
-                    if (v < minVal) minVal = v;
-                    if (v > maxVal) maxVal = v;
+                    float* bSrc = sbSrc + ib * 32;
+                    float bMin = bSrc[0];
+                    float bMax = bSrc[0];
+                    for (int i = 1; i < 32; i++)
+                    {
+                        float v = bSrc[i];
+                        if (v < bMin) bMin = v;
+                        if (v > bMax) bMax = v;
+                    }
+
+                    if (bMin > 0f) bMin = 0f;
+                    float range = bMax - bMin;
+                    float scale = range / 15.0f;
+                    subScale[ib] = scale;
+                    if (scale > maxScale) maxScale = scale;
+
+                    float minOffset = -bMin;
+                    subMin[ib] = minOffset;
+                    if (minOffset > maxMin) maxMin = minOffset;
                 }
 
-                float range = Math.Max(1e-12f, maxVal - minVal);
-                float d = range / 15.0f;
-                float dmin = minVal;
+                float invScale = maxScale > 0f ? 63.0f / maxScale : 0f;
+                float invMin = maxMin > 0f ? 63.0f / maxMin : 0f;
 
-                sbDst->D = (Half)d;
-                sbDst->DMin = (Half)dmin;
-
-                float invD = 15.0f / range;
-
-                // Clear 12 bytes scales and 128 bytes quants
-                for (int s = 0; s < 12; s++) sbDst->Scales[s] = 0;
-                for (int q = 0; q < 128; q++) sbDst->Quants[q] = 0;
-
-                // Pack 256 4-bit values into 128 bytes (2 nibbles per byte)
-                for (int i = 0; i < BlockQ4_K.BlockSize; i += 2)
+                for (int ib = 0; ib < 8; ib++)
                 {
-                    int q0 = (int)MathF.Round((sbSrc[i] - dmin) * invD);
-                    int q1 = (int)MathF.Round((sbSrc[i + 1] - dmin) * invD);
+                    int scQuant = (int)MathF.Round(subScale[ib] * invScale);
+                    sc[ib] = (byte)Math.Clamp(scQuant, 0, 63);
 
-                    q0 = Math.Clamp(q0, 0, 15);
-                    q1 = Math.Clamp(q1, 0, 15);
+                    int mQuant = (int)MathF.Round(subMin[ib] * invMin);
+                    m[ib] = (byte)Math.Clamp(mQuant, 0, 63);
+                }
 
-                    sbDst->Quants[i / 2] = (byte)(q0 | (q1 << 4));
+                for (int s = 0; s < 12; s++) sbDst->Scales[s] = 0;
+                for (int j = 0; j < 8; j++)
+                {
+                    SetScaleMinK4(j, sbDst->Scales, sc[j], m[j]);
+                }
+
+                sbDst->D = (Half)(maxScale / 63.0f);
+                sbDst->DMin = (Half)(maxMin / 63.0f);
+
+                float dSuper = (float)sbDst->D;
+                float dminSuper = (float)sbDst->DMin;
+
+                for (int ib = 0; ib < 8; ib++)
+                {
+                    float d = dSuper * sc[ib];
+                    float dm = dminSuper * m[ib];
+                    float invD = d > 0f ? 1.0f / d : 0f;
+
+                    float* bSrc = sbSrc + ib * 32;
+                    byte* bL = L + ib * 32;
+
+                    for (int i = 0; i < 32; i++)
+                    {
+                        int q = invD > 0f ? (int)MathF.Round((bSrc[i] + dm) * invD) : 0;
+                        bL[i] = (byte)Math.Clamp(q, 0, 15);
+                    }
+                }
+
+                byte* qDst = sbDst->Quants;
+                for (int g = 0; g < 256; g += 64)
+                {
+                    for (int l = 0; l < 32; l++)
+                    {
+                        qDst[l] = (byte)(L[g + l] | (L[g + l + 32] << 4));
+                    }
+                    qDst += 32;
                 }
             }
         }
@@ -167,16 +214,57 @@ public static class SimdQuantizer
                 float d = (float)sbSrc->D;
                 float dmin = (float)sbSrc->DMin;
 
-                for (int i = 0; i < 128; i++)
+                int isIdx = 0;
+                for (int g = 0; g < 256; g += 64)
                 {
-                    byte packed = sbSrc->Quants[i];
-                    int q0 = packed & 0x0F;
-                    int q1 = (packed >> 4) & 0x0F;
+                    GetScaleMinK4(isIdx, sbSrc->Scales, out byte sc0, out byte m0);
+                    GetScaleMinK4(isIdx + 1, sbSrc->Scales, out byte sc1, out byte m1);
+                    float d0 = d * sc0;
+                    float dm0 = dmin * m0;
+                    float d1 = d * sc1;
+                    float dm1 = dmin * m1;
 
-                    sbDst[i * 2] = dmin + (q0 * d);
-                    sbDst[i * 2 + 1] = dmin + (q1 * d);
+                    byte* q = sbSrc->Quants + (g >> 1);
+                    for (int l = 0; l < 32; l++)
+                    {
+                        byte packed = q[l];
+                        sbDst[g + l] = d0 * (packed & 0x0F) - dm0;
+                        sbDst[g + l + 32] = d1 * ((packed >> 4) & 0x0F) - dm1;
+                    }
+                    isIdx += 2;
                 }
             }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void SetScaleMinK4(int j, byte* scales, byte sc, byte m)
+    {
+        if (j < 4)
+        {
+            scales[j] = (byte)((scales[j] & 0xC0) | (sc & 0x3F));
+            scales[j + 4] = (byte)((scales[j + 4] & 0xC0) | (m & 0x3F));
+        }
+        else
+        {
+            scales[j + 4] = (byte)((sc & 0x0F) | ((m & 0x0F) << 4));
+            scales[j - 4] = (byte)((scales[j - 4] & 0x3F) | ((sc >> 4) << 6));
+            scales[j] = (byte)((scales[j] & 0x3F) | ((m >> 4) << 6));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void GetScaleMinK4(int j, byte* q, out byte d, out byte m)
+    {
+        if (j < 4)
+        {
+            d = (byte)(q[j] & 63);
+            m = (byte)(q[j + 4] & 63);
+        }
+        else
+        {
+            d = (byte)((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+            m = (byte)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
         }
     }
 
