@@ -10,8 +10,8 @@
     
     <!-- Package Metadata -->
     <PackageId>Glacier.Quant</PackageId>
-    <Version>1.4.1</Version>
-    <PackageReleaseNotes>v1.4.1: Quantization kernel and GGUF/Safetensors reliability improvements.</PackageReleaseNotes>
+    <Version>1.4.2</Version>
+    <PackageReleaseNotes>v1.4.2: Align FP8_E4M3 GGUF tensor type ID to canonical 43u with legacy 104u read compatibility.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier Software</Company>
     <Product>Glacier .NET 10 Ecosystem</Product>

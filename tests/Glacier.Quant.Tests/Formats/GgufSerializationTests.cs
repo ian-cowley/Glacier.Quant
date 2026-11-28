@@ -92,6 +92,34 @@ public class GgufSerializationTests
     }
 
     [Fact]
+    public void GgufWriter_Fp8E4M3_UsesCanonicalGgmlType43_AndSupportsLegacy104()
+    {
+        Assert.Equal(43u, GgufWriter.ToGgmlType(QuantType.FP8_E4M3));
+        Assert.Equal(QuantType.FP8_E4M3, GgufWriter.FromGgmlType(43u));
+        Assert.Equal(QuantType.FP8_E4M3, GgufWriter.FromGgmlType(104u));
+
+        byte[] fp8Data = new byte[64];
+        for (int i = 0; i < fp8Data.Length; i++) fp8Data[i] = (byte)(i & 0x7E);
+
+        var tensors = new List<(QuantTensorMetadata Info, byte[] Data)>
+        {
+            (new QuantTensorMetadata { Name = "fp8.weight", Shape = [8, 8], Type = QuantType.FP8_E4M3 }, fp8Data)
+        };
+
+        using var ms = new MemoryStream();
+        GgufWriter.WriteToStream(ms, new Dictionary<string, string>(), tensors);
+        ms.Position = 0;
+
+        var (_, readTensors, dataStart) = GgufReader.ReadHeader(ms);
+        Assert.Single(readTensors);
+        Assert.Equal(QuantType.FP8_E4M3, readTensors[0].Type);
+        ms.Position = dataStart + (long)readTensors[0].DataOffset;
+        byte[] actual = new byte[fp8Data.Length];
+        ms.ReadExactly(actual);
+        Assert.Equal(fp8Data, actual);
+    }
+
+    [Fact]
     public void GgufWriter_And_GgufReader_All13MetadataTypesAndAlignment_Roundtrip()
     {
         var metadata = new Dictionary<string, object>
