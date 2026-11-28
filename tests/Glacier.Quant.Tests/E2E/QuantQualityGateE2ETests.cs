@@ -1,11 +1,13 @@
 namespace Glacier.Quant.Tests.E2E;
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Glacier.Quant.Calibration;
 using Glacier.Quant.Evaluation;
 using Glacier.Quant.Gpu;
@@ -20,7 +22,6 @@ public sealed class QuantQualityGateE2ETests
     public void T3_17_QuantKlGateAndSecurityAuditOnIsolatedArtifactDirectory()
     {
         string? repoRoot = TryFindRepoRoot();
-        string? scannerPath = repoRoot is not null ? Path.Combine(repoRoot, "scripts", "security_check.py") : null;
 
         const int numTokens = 6;
         const int vocabSize = 8;
@@ -39,9 +40,6 @@ public sealed class QuantQualityGateE2ETests
 
         Assert.True(gateResult.Passed, gateResult.FailureReason);
 
-        if (scannerPath is null || !File.Exists(scannerPath))
-            return;
-
         string tempRoot = Path.Combine(Path.GetTempPath(), "glacier_quant_t3_17_" + Guid.NewGuid().ToString("N"));
         string cleanDir = Path.Combine(tempRoot, "clean_artifacts");
         string leakDir = Path.Combine(tempRoot, "negative_probe");
@@ -57,18 +55,30 @@ public sealed class QuantQualityGateE2ETests
                 Path.Combine(cleanDir, "config_sample.cs"),
                 "var apiKey = Environment.GetEnvironmentVariable(\"GEMINI_API_KEY\");\n");
 
-            (int cleanExit, string cleanOut) = RunPythonScript(scannerPath, cleanDir);
+            (int cleanExit, string cleanOut) = RunPureCSharpSecretAudit(cleanDir);
             Assert.Equal(0, cleanExit);
             Assert.Contains("[PASSED]", cleanOut, StringComparison.Ordinal);
+
+            if (TryRunGlacierCliSecurityCheck(repoRoot, cleanDir) is var (cliCleanExit, cliCleanOut))
+            {
+                Assert.Equal(0, cliCleanExit);
+                Assert.Contains("[PASSED]", cliCleanOut, StringComparison.Ordinal);
+            }
 
             // Isolated negative fixture constructed dynamically at runtime outside repo tree
             string syntheticPattern = string.Concat("sk", "-", new string('A', 22), "99");
             string leakyFile = Path.Combine(leakDir, "leaky.json");
             File.WriteAllText(leakyFile, string.Concat("{\"token\": \"", syntheticPattern, "\"}\n"));
 
-            (int leakExit, string leakOut) = RunPythonScript(scannerPath, leakDir);
+            (int leakExit, string leakOut) = RunPureCSharpSecretAudit(leakDir);
             Assert.NotEqual(0, leakExit);
             Assert.Contains("leaky.json", leakOut, StringComparison.Ordinal);
+
+            if (TryRunGlacierCliSecurityCheck(repoRoot, leakDir) is var (cliLeakExit, cliLeakOut))
+            {
+                Assert.NotEqual(0, cliLeakExit);
+                Assert.Contains("leaky.json", cliLeakOut, StringComparison.Ordinal);
+            }
         }
         finally
         {
@@ -235,8 +245,29 @@ public sealed class QuantQualityGateE2ETests
         Assert.Throws<NotSupportedException>(() => GpuQuantizationDispatcher.GetQuantizedByteCount(n, QuantType.FP8_E5M2));
         Assert.Throws<ArgumentException>(() => GpuQuantizationDispatcher.GetQuantizedByteCount(100, QuantType.Q4_K_M));
 
-        // FP32 raw byte buffer round-trip via DequantizeTensor and EvaluateQuantizedBuffer
+        // Honest GPU dispatcher reporting & FP32 QuantizeTensor round-trip
+        Assert.False(GpuQuantizationDispatcher.IsGpuAccelerationAvailable);
+        Assert.Equal("CPU-SIMD", GpuQuantizationDispatcher.ExecutionBackend);
+
         byte[] fp32Bytes = MemoryMarshal.AsBytes(weights.AsSpan()).ToArray();
+        byte[] fp32RoundTripBytes = new byte[n * sizeof(float)];
+        GpuQuantizationDispatcher.QuantizeTensor(weights, QuantType.FP32, fp32RoundTripBytes, out float fp32DynScale);
+        Assert.Equal(1.0f, fp32DynScale);
+        Assert.Equal(fp32Bytes, fp32RoundTripBytes);
+        Assert.Throws<ArgumentException>(() => GpuQuantizationDispatcher.QuantizeTensor(weights, QuantType.FP32, new byte[4], out _));
+
+        Assert.Throws<NotSupportedException>(() =>
+        {
+            byte[] scratch = new byte[64];
+            GpuQuantizationDispatcher.QuantizeTensor(weights.AsSpan(0, 16), QuantType.FP32, scratch, out _, requireGpu: true);
+        });
+        Assert.Throws<NotSupportedException>(() =>
+        {
+            float[] scratch = new float[16];
+            GpuQuantizationDispatcher.DequantizeTensor(fp32Bytes.AsSpan(0, 64), QuantType.FP32, scratch, 1.0f, requireGpu: true);
+        });
+
+        // FP32 raw byte buffer round-trip via DequantizeTensor and EvaluateQuantizedBuffer
         float[] fp32Out = new float[n];
         GpuQuantizationDispatcher.DequantizeTensor(fp32Bytes, QuantType.FP32, fp32Out);
         Assert.Equal(weights, fp32Out);
@@ -370,30 +401,138 @@ public sealed class QuantQualityGateE2ETests
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir is not null)
         {
-            if (File.Exists(Path.Combine(dir.FullName, "scripts", "security_check.py")))
+            if (File.Exists(Path.Combine(dir.FullName, "Glacier.slnx")))
                 return dir.FullName;
             dir = dir.Parent;
         }
         return null;
     }
 
-    private static (int ExitCode, string Output) RunPythonScript(string scriptPath, string targetDir)
+    private static (int ExitCode, string Output) RunPureCSharpSecretAudit(string targetDir)
     {
-        var psi = new ProcessStartInfo
+        var patterns = new (string Name, Regex Pattern, bool IsGeneric)[]
         {
-            FileName = OperatingSystem.IsWindows() ? "python" : "python3",
+            ("Google AI / Gemini / Maps API Key", new Regex(@"\bAIza[0-9A-Za-z-_]{35}\b", RegexOptions.Compiled), false),
+            ("OpenAI API Key", new Regex(@"\bsk-[a-zA-Z0-9]{20,}\b", RegexOptions.Compiled), false),
+            ("Anthropic API Key", new Regex(@"\bsk-ant-[a-zA-Z0-9-_]{20,}\b", RegexOptions.Compiled), false),
+            ("GitHub Personal Access Token", new Regex(@"\bgh[pousr]_[A-Za-z0-9_]{36,255}\b", RegexOptions.Compiled), false),
+            ("AWS Access Key ID", new Regex(@"\b(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}\b", RegexOptions.Compiled), false),
+            ("Private Key Block", new Regex(@"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", RegexOptions.Compiled), false),
+            ("HuggingFace Token", new Regex(@"\bhf_[a-zA-Z0-9]{34,}\b", RegexOptions.Compiled), false),
+            ("NuGet API Key", new Regex(@"\boy2[a-z0-9]{43}\b", RegexOptions.Compiled), false),
+            ("Generic Secret Assignment", new Regex(@"(?i)(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|password|client[_-]?secret)\s*[:=]\s*[""']([^""'\s]{12,})[""']", RegexOptions.Compiled), true)
+        };
+
+        var allowlist = new Regex[]
+        {
+            new(@"(?i)placeholder", RegexOptions.Compiled),
+            new(@"(?i)dummy", RegexOptions.Compiled),
+            new(@"(?i)fake", RegexOptions.Compiled),
+            new(@"(?i)sample", RegexOptions.Compiled),
+            new(@"(?i)example", RegexOptions.Compiled),
+            new(@"(?i)environment\.getenvironmentvariable", RegexOptions.Compiled),
+            new(@"(?i)process\.env", RegexOptions.Compiled)
+        };
+
+        var findings = new List<string>();
+        int scanned = 0;
+
+        foreach (string file in Directory.EnumerateFiles(targetDir, "*", SearchOption.AllDirectories))
+        {
+            scanned++;
+            string[] lines = File.ReadAllLines(file);
+            for (int idx = 0; idx < lines.Length; idx++)
+            {
+                string line = lines[idx];
+                foreach (var (name, regex, isGeneric) in patterns)
+                {
+                    foreach (Match m in regex.Matches(line))
+                    {
+                        string token = m.Groups.Count > 1 && m.Groups[1].Success ? m.Groups[1].Value : m.Value;
+                        if (isGeneric && Array.Exists(allowlist, a => a.IsMatch(token)))
+                            continue;
+
+                        string rel = Path.GetRelativePath(targetDir, file);
+                        findings.Add($"FAILED: {rel}:{idx + 1} -> {name}");
+                    }
+                }
+            }
+        }
+
+        if (findings.Count > 0)
+            return (1, $"Scanned {scanned} files.\n" + string.Join("\n", findings));
+
+        return (0, $"Scanned {scanned} files.\n[PASSED] Zero secrets or credentials detected.");
+    }
+
+    private static (int ExitCode, string Output)? TryRunGlacierCliSecurityCheck(string? repoRoot, string targetDir)
+    {
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrEmpty(localAppData))
+        {
+            string installedExe = Path.Combine(localAppData, "Glacier", "bin", OperatingSystem.IsWindows() ? "glacier.exe" : "glacier");
+            if (File.Exists(installedExe))
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = installedExe,
+                    WorkingDirectory = targetDir,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                psi.ArgumentList.Add("security-check");
+                psi.ArgumentList.Add(targetDir);
+
+                using var proc = Process.Start(psi);
+                if (proc is not null)
+                {
+                    string stdout = proc.StandardOutput.ReadToEnd();
+                    string stderr = proc.StandardError.ReadToEnd();
+                    proc.WaitForExit();
+                    string combined = stdout + "\n" + stderr;
+                    if (!combined.Contains("Unknown command", StringComparison.OrdinalIgnoreCase))
+                        return (proc.ExitCode, combined);
+                }
+            }
+        }
+
+        if (repoRoot is null)
+            return null;
+
+        string preferredCfg = AppContext.BaseDirectory.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+            ? "Release"
+            : "Debug";
+        string? cliDll = null;
+        foreach (string cfg in new[] { preferredCfg, preferredCfg == "Release" ? "Debug" : "Release" })
+        {
+            string candidate = Path.Combine(repoRoot, "Glacier.Cli", "src", "Glacier.Cli", "bin", cfg, "net10.0", "glacier.dll");
+            if (File.Exists(candidate) && File.Exists(Path.ChangeExtension(candidate, ".runtimeconfig.json")))
+            {
+                cliDll = candidate;
+                break;
+            }
+        }
+        if (cliDll is null) return null;
+
+        var dllPsi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            WorkingDirectory = repoRoot,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true
         };
-        psi.ArgumentList.Add(scriptPath);
-        psi.ArgumentList.Add(targetDir);
+        dllPsi.ArgumentList.Add(cliDll);
+        dllPsi.ArgumentList.Add("security-check");
+        dllPsi.ArgumentList.Add(targetDir);
 
-        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start python process.");
-        string stdout = proc.StandardOutput.ReadToEnd();
-        string stderr = proc.StandardError.ReadToEnd();
-        proc.WaitForExit();
-        return (proc.ExitCode, stdout + "\n" + stderr);
+        using var dllProc = Process.Start(dllPsi) ?? throw new InvalidOperationException("Failed to start dotnet glacier.dll process.");
+        string dllStdout = dllProc.StandardOutput.ReadToEnd();
+        string dllStderr = dllProc.StandardError.ReadToEnd();
+        dllProc.WaitForExit();
+        return (dllProc.ExitCode, dllStdout + "\n" + dllStderr);
     }
 }

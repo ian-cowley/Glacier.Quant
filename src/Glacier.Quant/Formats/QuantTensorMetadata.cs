@@ -10,6 +10,8 @@ public sealed record QuantTensorMetadata
     public QuantType Type { get; init; } = QuantType.FP32;
     public ulong DataOffset { get; set; }
     public ulong DataLength { get; set; }
+    public float? DynamicScale { get; init; }
+    public string? ScaleTensorName { get; init; }
 
     public long TotalElements
     {

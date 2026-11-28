@@ -43,7 +43,7 @@ dotnet add package Glacier.Quant
 ## Testing & Verification
 
 ```bash
-dotnet test Glacier.Quant.slnx -c Release    # 199 / 199 passed
+dotnet test Glacier.Quant.slnx -c Release    # 237 / 237 passed
 ```
 
 ## License

@@ -11,9 +11,9 @@ using System.Threading.Tasks;
 /// one-sided Hestenes-Jacobi exact SVD, tall/wide randomized truncated SVD, and
 /// Perron-Frobenius rank-1 non-negative magnitude SVD.
 /// </summary>
-internal static class LittleBit2Svd
+public static class LittleBit2Svd
 {
-    internal static void OrthonormalizeColumns(double[] matrixColMajor, int rows, int cols)
+    public static void OrthonormalizeColumns(double[] matrixColMajor, int rows, int cols)
     {
         for (int j = 0; j < cols; j++)
         {
@@ -92,7 +92,7 @@ internal static class LittleBit2Svd
         }
     }
 
-    internal static void OrthonormalizeRowMajorColumns(double[] matrixRowMajor, int rows, int cols)
+    public static void OrthonormalizeRowMajorColumns(double[] matrixRowMajor, int rows, int cols)
     {
         int total = checked(rows * cols);
         double[] colMajor = ArrayPool<double>.Shared.Rent(total);
@@ -120,7 +120,7 @@ internal static class LittleBit2Svd
         }
     }
 
-    internal static double[] CreateRandomOrthogonal(int size, int seed)
+    public static double[] CreateRandomOrthogonal(int size, int seed)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(size);
         if (size == 1)
@@ -219,7 +219,7 @@ internal static class LittleBit2Svd
         return rMat;
     }
 
-    internal static void ExactSvd(
+    public static void ExactSvd(
         ReadOnlySpan<double> matrixRowMajor,
         int m,
         int n,
@@ -429,7 +429,7 @@ internal static class LittleBit2Svd
         }
     }
 
-    internal static void TruncatedSvd(
+    public static void TruncatedSvd(
         ReadOnlySpan<float> matrixRowMajor,
         int m,
         int n,
@@ -593,7 +593,7 @@ internal static class LittleBit2Svd
         }
     }
 
-    internal static void RankOneNonNegativeSvd(
+    public static void RankOneNonNegativeSvd(
         ReadOnlySpan<double> absMatrixRowMajor,
         int m,
         int n,

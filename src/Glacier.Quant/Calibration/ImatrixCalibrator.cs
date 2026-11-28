@@ -1,6 +1,7 @@
 namespace Glacier.Quant.Calibration;
 
 using System;
+using System.Buffers;
 
 /// <summary>
 /// Importance Matrix (imatrix) PTQ calibrator.
@@ -14,49 +15,183 @@ public static class ImatrixCalibrator
         int rows,
         int cols,
         CalibrationDataset dataset)
+        => Calibrate(weights, rows, cols, dataset, targetBits: 8);
+
+    public static PtqCalibrationResult Calibrate(
+        float[] weights,
+        int rows,
+        int cols,
+        CalibrationDataset dataset,
+        int targetBits)
     {
         ArgumentNullException.ThrowIfNull(weights);
         ArgumentNullException.ThrowIfNull(dataset);
-        if (weights.Length != rows * cols)
-            throw new ArgumentException("Weights length does not match rows * cols.");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(rows);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cols);
+
+        long totalWeights = (long)rows * cols;
+        if (weights.Length != totalWeights)
+            throw new ArgumentException($"Weights length ({weights.Length}) does not match rows * cols ({totalWeights}).", nameof(weights));
         if (dataset.HiddenDim != cols)
-            throw new ArgumentException($"Dataset hidden dim ({dataset.HiddenDim}) does not match weight cols ({cols}).");
+            throw new ArgumentException($"Dataset hidden dim ({dataset.HiddenDim}) does not match weight cols ({cols}).", nameof(dataset));
+        if (targetBits is < 2 or > 8)
+            throw new ArgumentOutOfRangeException(nameof(targetBits), targetBits, "Target bits must be in [2, 8].");
 
-        // 1. Compute second moment diagonal vector: I_j = sum_k X_{k, j}^2
+        EnsureAllFinite(weights, nameof(weights));
+        EnsureAllFinite(dataset.Activations.AsSpan(0, checked(dataset.NumTokens * cols)), nameof(dataset));
+
+        float maxQ = (1 << (targetBits - 1)) - 1;
+        float minQ = -(1 << (targetBits - 1));
+
+        // 1. Compute second moment diagonal vector in double: I_j = sum_k X_{k, j}^2
         float[] imatrix = new float[cols];
-        for (int k = 0; k < dataset.NumTokens; k++)
-        {
-            var row = dataset.GetTokenVector(k);
-            for (int j = 0; j < cols; j++)
-            {
-                imatrix[j] += row[j] * row[j];
-            }
-        }
-
-        // Normalize so mean importance is 1.0
-        float sumI = 0.0f;
-        for (int j = 0; j < cols; j++) sumI += imatrix[j];
-        float invMeanI = cols / Math.Max(1e-12f, sumI);
-        for (int j = 0; j < cols; j++)
-        {
-            imatrix[j] = Math.Max(1e-4f, imatrix[j] * invMeanI);
-        }
-
-        // 2. Compute baseline unweighted RTN
+        double[] imatrixAcc = ArrayPool<double>.Shared.Rent(cols);
         const int blockSize = 32;
-        float[] baselineQuant = QuantizeBlockRtn(weights, rows, cols, blockSize);
-        double baselineWeightedMse = ComputeWeightedMse(weights, baselineQuant, rows, cols, imatrix);
+        float[] baselineQuant = ArrayPool<float>.Shared.Rent(weights.Length);
+        try
+        {
+            Array.Clear(imatrixAcc, 0, cols);
+            for (int k = 0; k < dataset.NumTokens; k++)
+            {
+                ReadOnlySpan<float> row = dataset.GetTokenVector(k);
+                for (int j = 0; j < cols; j++)
+                {
+                    double x = row[j];
+                    imatrixAcc[j] += x * x;
+                }
+            }
 
-        // 3. Optimize scale per block using importance weights
-        float[] calibrated = (float[])weights.Clone();
+            // Scale-invariant normalization so mean importance is 1.0 across any finite activation scale
+            double sumI = 0.0;
+            for (int j = 0; j < cols; j++)
+                sumI += imatrixAcc[j];
 
+            if (sumI <= 0.0 || !double.IsFinite(sumI))
+            {
+                Array.Fill(imatrix, 1e-4f);
+            }
+            else
+            {
+                double meanI = sumI / cols;
+                for (int j = 0; j < cols; j++)
+                    imatrix[j] = (float)Math.Clamp(imatrixAcc[j] / meanI, 1e-4, float.MaxValue);
+            }
+
+            // 2. Compute baseline unweighted RTN using pooled scratch
+            QuantizeBlockRtnInto(weights, baselineQuant.AsSpan(0, weights.Length), rows, cols, blockSize, minQ, maxQ);
+            double baselineWeightedMse = ComputeWeightedMse(weights, baselineQuant.AsSpan(0, weights.Length), rows, cols, imatrix);
+
+            // 3. Optimize scale per block using importance weights
+            float[] calibrated = (float[])weights.Clone();
+
+            for (int r = 0; r < rows; r++)
+            {
+                int rOffset = r * cols;
+                for (int b = 0; b < cols; b += blockSize)
+                {
+                    int curBlock = Math.Min(blockSize, cols - b);
+
+                    float amax = 0.0f;
+                    for (int j = 0; j < curBlock; j++)
+                    {
+                        float a = MathF.Abs(weights[rOffset + b + j]);
+                        if (a > amax) amax = a;
+                    }
+
+                    if (amax <= 1e-12f)
+                    {
+                        for (int j = 0; j < curBlock; j++)
+                            calibrated[rOffset + b + j] = 0.0f;
+                        continue;
+                    }
+
+                    float baseScale = amax / maxQ;
+                    float bestScale = baseScale;
+
+                    // Compute loss at baseScale
+                    double bestBlockLoss = 0.0;
+                    float invBase = 1.0f / baseScale;
+                    for (int j = 0; j < curBlock; j++)
+                    {
+                        int c = b + j;
+                        float origVal = weights[rOffset + c];
+                        float q = MathF.Round(origVal * invBase);
+                        q = Math.Clamp(q, minQ, maxQ);
+                        double diff = (double)origVal - (double)(q * baseScale);
+                        bestBlockLoss += (double)imatrix[c] * diff * diff;
+                    }
+
+                    // Try 15 scale candidates around base scale [0.7x .. 1.3x]
+                    for (int sIdx = 0; sIdx < 15; sIdx++)
+                    {
+                        float candScale = baseScale * (0.7f + (sIdx * 0.0428f));
+                        float invCandScale = 1.0f / candScale;
+                        double candLoss = 0.0;
+
+                        for (int j = 0; j < curBlock; j++)
+                        {
+                            int c = b + j;
+                            float origVal = weights[rOffset + c];
+                            float q = MathF.Round(origVal * invCandScale);
+                            q = Math.Clamp(q, minQ, maxQ);
+                            float dequant = q * candScale;
+
+                            double diff = (double)origVal - (double)dequant;
+                            candLoss += (double)imatrix[c] * diff * diff;
+                        }
+
+                        if (candLoss < bestBlockLoss)
+                        {
+                            bestBlockLoss = candLoss;
+                            bestScale = candScale;
+                        }
+                    }
+
+                    // Apply best scale
+                    float invBest = 1.0f / bestScale;
+                    for (int j = 0; j < curBlock; j++)
+                    {
+                        int c = b + j;
+                        float q = MathF.Round(weights[rOffset + c] * invBest);
+                        q = Math.Clamp(q, minQ, maxQ);
+                        calibrated[rOffset + c] = q * bestScale;
+                    }
+                }
+            }
+
+            double calibratedWeightedMse = ComputeWeightedMse(weights, calibrated, rows, cols, imatrix);
+
+            return new PtqCalibrationResult
+            {
+                Method = $"imatrix ({targetBits}-bit Importance-Weighted Least Squares)",
+                CalibratedWeights = calibrated,
+                OptimalScales = imatrix,
+                BaselineRtnMse = baselineWeightedMse,
+                CalibratedMse = calibratedWeightedMse
+            };
+        }
+        finally
+        {
+            ArrayPool<double>.Shared.Return(imatrixAcc);
+            ArrayPool<float>.Shared.Return(baselineQuant);
+        }
+    }
+
+    private static void QuantizeBlockRtnInto(
+        ReadOnlySpan<float> weights,
+        Span<float> result,
+        int rows,
+        int cols,
+        int blockSize,
+        float minQ,
+        float maxQ)
+    {
         for (int r = 0; r < rows; r++)
         {
             int rOffset = r * cols;
             for (int b = 0; b < cols; b += blockSize)
             {
                 int curBlock = Math.Min(blockSize, cols - b);
-
                 float amax = 0.0f;
                 for (int j = 0; j < curBlock; j++)
                 {
@@ -66,106 +201,28 @@ public static class ImatrixCalibrator
 
                 if (amax <= 1e-12f)
                 {
-                    for (int j = 0; j < curBlock; j++) calibrated[rOffset + b + j] = 0.0f;
+                    result.Slice(rOffset + b, curBlock).Clear();
                     continue;
                 }
 
-                float baseScale = amax / 127.0f;
-                float bestScale = baseScale;
-                
-                // Compute loss at baseScale
-                double bestBlockLoss = 0.0;
-                float invBase = 1.0f / baseScale;
-                for (int j = 0; j < curBlock; j++)
-                {
-                    int c = b + j;
-                    float origVal = weights[rOffset + c];
-                    float q = MathF.Round(origVal * invBase);
-                    q = Math.Clamp(q, -128.0f, 127.0f);
-                    float diff = origVal - (q * baseScale);
-                    bestBlockLoss += imatrix[c] * diff * diff;
-                }
-
-                // Try 15 scale candidates around base scale [0.7x .. 1.3x]
-                for (int sIdx = 0; sIdx < 15; sIdx++)
-                {
-                    float candScale = baseScale * (0.7f + (sIdx * 0.0428f));
-                    float invCandScale = 1.0f / candScale;
-                    double candLoss = 0.0;
-
-                    for (int j = 0; j < curBlock; j++)
-                    {
-                        int c = b + j;
-                        float origVal = weights[rOffset + c];
-                        float q = MathF.Round(origVal * invCandScale);
-                        q = Math.Clamp(q, -128.0f, 127.0f);
-                        float dequant = q * candScale;
-
-                        float diff = origVal - dequant;
-                        candLoss += imatrix[c] * diff * diff;
-                    }
-
-                    if (candLoss < bestBlockLoss)
-                    {
-                        bestBlockLoss = candLoss;
-                        bestScale = candScale;
-                    }
-                }
-
-                // Apply best scale
-                float invBest = 1.0f / bestScale;
-                for (int j = 0; j < curBlock; j++)
-                {
-                    int c = b + j;
-                    float q = MathF.Round(weights[rOffset + c] * invBest);
-                    q = Math.Clamp(q, -128.0f, 127.0f);
-                    calibrated[rOffset + c] = q * bestScale;
-                }
-            }
-        }
-
-        double calibratedWeightedMse = ComputeWeightedMse(weights, calibrated, rows, cols, imatrix);
-
-        return new PtqCalibrationResult
-        {
-            Method = "imatrix (Importance-Weighted Least Squares)",
-            CalibratedWeights = calibrated,
-            OptimalScales = imatrix,
-            BaselineRtnMse = baselineWeightedMse,
-            CalibratedMse = calibratedWeightedMse
-        };
-    }
-
-    private static float[] QuantizeBlockRtn(float[] weights, int rows, int cols, int blockSize)
-    {
-        float[] result = new float[weights.Length];
-        for (int r = 0; r < rows; r++)
-        {
-            int rOffset = r * cols;
-            for (int b = 0; b < cols; b += blockSize)
-            {
-                int curBlock = Math.Min(blockSize, cols - b);
-                float amax = 0.0f;
-                for (int j = 0; j < curBlock; j++)
-                {
-                    float a = MathF.Abs(weights[rOffset + b + j]);
-                    if (a > amax) amax = a;
-                }
-                if (amax <= 1e-12f) continue;
-                float scale = amax / 127.0f;
-                float invScale = 1.0f / scale;
+                float scale = amax / maxQ;
+                float invScale = maxQ / amax;
                 for (int j = 0; j < curBlock; j++)
                 {
                     float q = MathF.Round(weights[rOffset + b + j] * invScale);
-                    q = Math.Clamp(q, -128.0f, 127.0f);
+                    q = Math.Clamp(q, minQ, maxQ);
                     result[rOffset + b + j] = q * scale;
                 }
             }
         }
-        return result;
     }
 
-    private static double ComputeWeightedMse(float[] orig, float[] quant, int rows, int cols, float[] imatrix)
+    private static double ComputeWeightedMse(
+        ReadOnlySpan<float> orig,
+        ReadOnlySpan<float> quant,
+        int rows,
+        int cols,
+        ReadOnlySpan<float> imatrix)
     {
         double sum = 0.0;
         for (int r = 0; r < rows; r++)
@@ -173,10 +230,19 @@ public static class ImatrixCalibrator
             int rOffset = r * cols;
             for (int c = 0; c < cols; c++)
             {
-                float diff = orig[rOffset + c] - quant[rOffset + c];
-                sum += imatrix[c] * diff * diff;
+                double diff = (double)orig[rOffset + c] - (double)quant[rOffset + c];
+                sum += (double)imatrix[c] * diff * diff;
             }
         }
-        return sum / (rows * cols);
+        return sum / ((double)rows * cols);
+    }
+
+    private static void EnsureAllFinite(ReadOnlySpan<float> values, string paramName)
+    {
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (!float.IsFinite(values[i]))
+                throw new ArgumentException($"Input contains non-finite value at index {i}.", paramName);
+        }
     }
 }

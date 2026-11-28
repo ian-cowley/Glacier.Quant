@@ -139,7 +139,7 @@ public sealed class QuantQualityCheckerTests
         const int hiddenDim = 64;
         const int numTokens = 16;
 
-        // O(1) scale weights so GptqCalibrator's fixed 0.25f step is well-conditioned
+        // O(1) scale weights for PTQ calibrator evaluation (AWQ, GPTQ, imatrix)
         var (weights, dataset) = CreateDeterministicFixture(vocabSize, hiddenDim, numTokens, weightScale: 1.0f, seed: 303);
 
         // Amplify two salient channels in activations to exercise AWQ channel scaling
@@ -168,7 +168,7 @@ public sealed class QuantQualityCheckerTests
             options: new KlDivergenceOptions { Threshold = 0.25 });
         Assert.True(awqQ4K.Passed);
 
-        // 2. GPTQ (uses fixed 0.25f quantization step, so O(1) weights with full-rank calibration tokens)
+        // 2. GPTQ (Cholesky blockwise calibration with full-rank calibration tokens)
         var (gptqWeights, gptqRawDataset) = CreateDeterministicFixture(vocabSize, hiddenDim, numTokens: 128, weightScale: 1.5f, seed: 304);
         float[] scaledActs = new float[gptqRawDataset.Activations.Length];
         for (int i = 0; i < scaledActs.Length; i++)
