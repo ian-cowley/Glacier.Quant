@@ -1,51 +1,111 @@
 # Glacier.Quant
 
-Cross-platform .NET 10 (Native AOT compatible) tensor quantization library covering `Q4_K_M`, `Q8_0`, `FP8`, 1-bit binary, LittleBit-2 sub-1-bit kernels, Hadamard rotations, NariQ trellis decoding (`TRL1..TRL6`), PTQ calibration (`AWQ`, `GPTQ`, `imatrix`, activation-weighted salient column selection), and streaming GGUF/Safetensors I/O.
+[![NuGet CI](https://github.com/ian-cowley/Glacier.Quant/actions/workflows/publish-nuget.yml/badge.svg)](https://github.com/ian-cowley/Glacier.Quant/actions/workflows/publish-nuget.yml)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)
+![NativeAOT](https://img.shields.io/badge/NativeAOT-Compatible-brightgreen.svg)
 
-## What's in v1.4.0 — Hadamard & NariQ Trellis Kernels (`Glacier.Quant.Kernels`)
+`Glacier.Quant` is a cross-platform .NET 10 tensor quantization library for compressing, calibrating, evaluating, and exporting large language model weights in pure C#. It includes SIMD quantization kernels (`Q4_K_M`, `Q8_0`, `FP8`, 1-bit binary), sub-1-bit LittleBit-2 SVD/ADMM codecs, Sylvester and Paley Hadamard rotations, NariQ trellis decoding (`TRL1..TRL6`), PTQ calibrators (`AWQ`, `GPTQ`, `imatrix`), and streaming `GGUF` / `Safetensors` writers.
 
-- **`HadamardTransform`**:
-  - `ApplySylvesterInPlace(Span<float> data, int blockLen)` — AVX-512F / AVX2 / scalar normalized block Sylvester FWHT (`H * H = I`, fused in-register `h = 1, 2, 4, 8` butterflies and final `1 / sqrt(blockLen)` scaling).
-  - `ApplyPaleyInPlace` / `ApplyPaleyInverseInPlace` & `ApplyKroneckerPaleyInPlace` / `ApplyKroneckerPaleyInverseInPlace` — SIMD Paley Type-I orthogonal Hadamard (`m in {12, 20, 68}`) and full-slice Kronecker transforms (`m * 2^p`).
-  - `GenerateRandomSigns`, `ApplyRandomizedRotation`, `ApplyRandomizedRotationInverse` — QuaRot / SpinQuant / QuIP# / NariQ randomized Hadamard rotation.
-- **`NariQTrellisCodec`**:
-  - Bit-exact `TRL1..TRL6` (`1..6` bits/weight) `16x16` circular bitstream decoder using the `0x83DCD12Du` procedural codebook and portable 32-bit SWAR horizontal byte sum (`DecodeStateSwar` vs `DecodeStateScalar`).
-  - `DecodeTileInt8`, `DecodeTileFloat`, `DecodeRows`, `DotTileRowSimd`, AVX-512F / AVX2+FMA `TileMatVecAdd`, and `InspectTile` (`TileErrorMetrics` RMSE/MAE/SNR).
+---
 
-### Empirical Benchmarks (Windows 11, .NET 10.0 Release, Zen 5 AVX-512F, 24 Threads)
-
-Measured via `dotnet run --project benchmarks/Glacier.Quant.Benchmarks/Glacier.Quant.Benchmarks.csproj -c Release`:
-
-| Kernel / Workload | Shape / Scope | Measured Latency | Throughput |
-| :--- | :--- | :---: | :---: |
-| **`HadamardTransform.ApplySylvesterInPlace`** | 16,384 floats, `blockLen = 128` | **4.25 &mu;s** | **15.40 GB/s** |
-| **`HadamardTransform.ApplySylvesterInPlace`** | 16,384 floats, `blockLen = 512` | **4.77 &mu;s** | **13.75 GB/s** |
-| **`HadamardTransform.ApplySylvesterInPlace`** | 16,384 floats, `blockLen = 4096` | **5.27 &mu;s** | **12.43 GB/s** |
-| **`HadamardTransform.ApplyPaleyInPlace`** | `m = 12` / `20` / `68` | **49.3 / 81.6 / 319.8 ns** | Single-vector transform |
-| **`HadamardTransform.ApplyKroneckerPaleyInPlace`** | `5120 (20*256)` / `17408 (68*256)` | **7.70 / 63.20 &mu;s** | **2.66 / 1.10 GB/s** |
-| **`NariQTrellisCodec.DecodeStateSwar` vs `Scalar`** | All 65,536 states (`0x83DCD12Du`) | **0.608 vs 0.993 ns/state** | **1.63&times; SWAR speedup** |
-| **`NariQTrellisCodec.DecodeTileInt8`** | `5120 x 256` (`TRL2` / `TRL3` / `TRL4`) | **4.04 / 3.85 / 4.06 ms** | **0.32 / 0.34 / 0.32 Gw/s** |
-| **`NariQTrellisCodec.TileMatVecAdd`** | `5120 x 256` (`TRL2` / `TRL3` / `TRL4`) | **3.89 / 3.94 / 3.72 ms** | **0.34 / 0.33 / 0.35 Gw/s** |
-
-## What's in v1.3.0
-
-- **SIMD + parallel LittleBit-2 SVD & ADMM refinement (`LittleBit2Svd`, `LittleBit2Quantizer`, `LittleBit2Options.AdmmIterations`):** Dual-SVID, Joint-ITQ, and randomized truncated SVD paths vectorize via `System.Numerics.Tensors.TensorPrimitives` and parallelize across independent output rows/tiles on matrices above `262,144` operations. Pure-CPU `LittleBit2Quantizer.RefinePathAdmm` (enabled via `LittleBit2Options.AdmmIterations`) performs alternating binary coordinate descent and closed-form scale updates with a strict monotonic Frobenius guard, and `LittleBit2Quantizer.Quantize(..., columnScales, ...)` / `ApplyInverseColumnScales` fold activation weights back into `ColScales` at zero inference overhead.
-- **Samsung LittleBit-2 checkpoint codec (`LittleBit2SamsungCodec`):** Converts SamsungLabs LSB-first `uint32` packed factors (`+1 -> 0, -1 -> 1`) to and from `LittleBit2Path` `ulong[]` (`+1 -> 1, -1 -> 0`) with bitwise-masked tails and log-space balanced FP16 scale packing (`PackSignedBalancedPath`, `FromSamsungCheckpointPath`).
-- **Activation-weighted salient column selector (`ActivationSalientSelector`):** Ranks high-impact input columns (`ActivationWeightedL2`, `WeightRms`, `WeightMaxAbs`, `Auto`) from `imatrix` JSON profiles or SIMD weight scans and computes normalized column scaling multipliers without skewing pinned salient columns.
-- **Large-margin KL / log-softmax stabilization (`KlDivergenceEvaluator`):** Replaces `Math.Log(1 + eps)` near the argmax logit with a `Log1p` formulation so `ComputeLogSoftmax` and `ComputeTokenKlDivergence` do not collapse to `0.0` at large logit margins (`>= 40`).
-
-## Installation
+## Install
 
 ```bash
 dotnet add package Glacier.Quant
 ```
 
-## Testing & Verification
+Or build and test from source:
 
 ```bash
-dotnet test Glacier.Quant.slnx -c Release    # 237 / 237 passed
+git clone https://github.com/ian-cowley/Glacier.Quant.git
+cd Glacier.Quant
+dotnet test Glacier.Quant.slnx -c Release
 ```
 
-## License
+---
 
-MIT
+## Quick Start
+
+Apply an in-place orthogonal Sylvester Hadamard rotation (QuaRot / SpinQuant) and quantize rows to `Q8_0` blocks:
+
+```csharp
+using Glacier.Quant.Kernels;
+
+float[] weights = new float[16_384];
+for (int i = 0; i < weights.Length; i++)
+{
+    weights[i] = ((i % 29) - 14) * 0.1f;
+}
+
+// Normalized block FWHT (H * H = I)
+HadamardTransform.ApplySylvesterInPlace(weights, blockLen: 512);
+
+// Quantize 32-element blocks to Q8_0 using AVX-512 / AVX2
+var q8Blocks = new BlockQ8_0[weights.Length / BlockQ8_0.BlockSize];
+SimdQuantizer.QuantizeRowQ8_0(weights, q8Blocks);
+```
+
+Decode a NariQ `16x16` trellis tile (`TRL3`, 3 bits/weight):
+
+```csharp
+using Glacier.Quant.Kernels;
+
+int wordsPerTile = NariQTrellisCodec.GetTileWordCount(bits: 3);
+uint[] packedTile = new uint[wordsPerTile];
+sbyte[] decoded = new sbyte[NariQTrellisCodec.TileElements];
+
+NariQTrellisCodec.DecodeTileInt8(packedTile, bits: 3, decoded);
+```
+
+---
+
+## What You Can Do
+
+- **Block & Scalar Quantization (`SimdQuantizer`, `Fp8DynamicScaler`):** Quantize and dequantize `Q4_K_M`, `Q8_0`, `FP8_E4M3` (canonical GGUF type ID `43u` with legacy `104u` read compatibility), and 1-bit binary blocks (`BlockBinary1Bit`).
+- **Hadamard Outlier Suppression (`HadamardTransform`):** Run normalized block Sylvester FWHT, Paley Type-I (`m in {12, 20, 68}`), Kronecker Paley-Sylvester transforms (`m * 2^p`), and randomized sign rotations.
+- **NariQ Trellis Codecs (`NariQTrellisCodec`):** Decode `TRL1..TRL6` circular bitstreams via portable 32-bit SWAR (`0x83DCD12Du`), compute `TileMatVecAdd`, and measure `TileErrorMetrics` (RMSE, MAE, SNR).
+- **LittleBit-2 Sub-1-Bit Quantization (`LittleBit2Quantizer`):** Factor matrices via Dual-SVID, Joint-ITQ, ADMM refinement, activation column scale folding, and Samsung checkpoint interop (`LittleBit2SamsungCodec`).
+- **PTQ Calibration, Evaluation & Export:** Run `AwqCalibrator`, `GptqCalibrator`, `ImatrixCalibrator`, and `ActivationSalientSelector`, evaluate quality with `KlDivergenceEvaluator` (`Log1p`-stabilized) and `QuantQualityChecker`, and export checkpoints with `GgufWriter` / `SafetensorsWriter`.
+
+---
+
+## Platform & Compatibility
+
+- **Runtime:** .NET 10 (`net10.0`), Native AOT compatible (`IsAotCompatible=true`).
+- **SIMD & GPU Dispatch:** AVX-512F, AVX2/FMA, and `TensorPrimitives` across CPU cores; optional CUDA dispatch hooks in `GpuQuantizationDispatcher`.
+- **Cross-Platform:** Tested on Windows and Linux x64 in GitHub Actions CI.
+
+---
+
+## Benchmarks
+
+Measured in `Release` on Windows 11 with an AMD Ryzen AI 9 HX 370 (AVX-512F, 24 threads). Reproduce with `dotnet run --project benchmarks/Glacier.Quant.Benchmarks/Glacier.Quant.Benchmarks.csproj -c Release`:
+
+| Kernel / Workload | Shape / Scope | Latency | Throughput / Metric |
+| :--- | :--- | ---: | :--- |
+| `HadamardTransform.ApplySylvesterInPlace` | 16,384 floats, `blockLen = 128` | 5.69 us | 11.52 GB/s |
+| `HadamardTransform.ApplySylvesterInPlace` | 16,384 floats, `blockLen = 512` | 4.42 us | 14.84 GB/s |
+| `HadamardTransform.ApplyKroneckerPaleyInPlace` | `5120` (`20 * 256`) | 7.34 us | 2.79 GB/s |
+| `NariQTrellisCodec.DecodeStateSwar` vs `Scalar` | 65,536-state codebook | 0.798 vs 1.058 ns/state | 1.33x SWAR speedup |
+| `NariQTrellisCodec.DecodeTileInt8` (`TRL3` / `TRL4`) | `5120 x 256` (`1.31M` weights) | 3.47 ms / 3.34 ms | 0.38 / 0.39 Gw/s |
+| `NariQTrellisCodec.TileMatVecAdd` (`TRL2` / `TRL4`) | `5120 x 256` (`1.31M` weights) | 3.61 ms / 3.57 ms | 0.36 / 0.37 Gw/s |
+
+See [the full benchmark suite](docs/benchmarks.md) for all measured block lengths and bitrates.
+
+---
+
+## Documentation
+
+- [User Manual](docs/manual.md) — API reference for kernels, Hadamard rotations, NariQ trellis, LittleBit-2, calibrators, evaluators, and GGUF/Safetensors I/O
+- [Architecture](docs/architecture.md) — Block formats, SWAR/SIMD kernel designs, ADMM/Cholesky calibration, and streaming writers
+- [Benchmarks](docs/benchmarks.md) — Workstation specs, reproduction command, and complete kernel benchmark tables
+- [Changelog](CHANGELOG.md) — Version history (`v1.3.0` to `v1.4.2`)
+
+---
+
+## License & Credits
+
+Licensed under the MIT License.
+
+Developed by Ian Cowley, Antigravity (Google DeepMind) and Claude.
